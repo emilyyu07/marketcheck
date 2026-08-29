@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "marketcheck"
+version = "0.1.0"
+description = "CLI tool to validate historical US-equity OHLCV market data for research and backtesting."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+    { name = "Emily Yu" },
+]
+dependencies = [
+    "polars>=0.20",
+    "pydantic>=2",
+    "pandas-market-calendars>=4",
+    "typer>=0.9",
+]
+
+[project.scripts]
+marketcheck = "marketcheck.cli.main:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/marketcheck"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["marketcheck"]
+mypy_path = "src"
+
+[dependency-groups]
+dev = [
+    "ruff",
+    "mypy",
+    "pytest",
+    "pytest-cov",
+]
