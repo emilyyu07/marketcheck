@@ -1,6 +1,17 @@
-"""Structural validation rules (5 rules)."""
+"""
+Structural validation rules (5 rules).
 
-from marketcheck.ingestion.schema import REQUIRED_COLUMNS
+These rules check the structure of the dataset, 
+including required columns, data types, and timestamp ordering.
+
+Rule 1: MissingColumns
+Rule 2: InvalidDTypes
+Rule 3:
+Rule 4:
+Rule 5:
+"""
+
+from marketcheck.ingestion.schema import EXPECTED_DTYPES, REQUIRED_COLUMNS
 from marketcheck.models.dataset import CanonicalDataset
 from marketcheck.models.enums import Category, Severity, Status
 from marketcheck.models.result import ValidationResult
@@ -17,11 +28,10 @@ class DuplicateTimestamps(ValidationRule):
     def validate(self, dataset: CanonicalDataset, context: RuleContext) -> ValidationResult:
         raise NotImplementedError("TODO: implement structural.duplicate_timestamps")
 
-
 '''
-Rule 1: MissingColumns
-This rule checks that all required columns are present in the dataset.
-If any required columns are missing, the rule fails and reports which columns are missing.
+Rule 1: Missing Required Columns
+Checks if the dataset contains all required columns. 
+If any required columns are missing, the rule fails.
 '''
 @register
 class MissingColumns(ValidationRule):
@@ -55,6 +65,11 @@ class MissingColumns(ValidationRule):
         )
 
 
+'''
+Rule 2: Invalid Data Types
+Checks if the dataset columns have the expected data types.
+If any column has an unexpected data type, the rule fails.
+'''
 @register
 class InvalidDtypes(ValidationRule):
     rule_id = "structural.invalid_dtypes"
@@ -63,7 +78,34 @@ class InvalidDtypes(ValidationRule):
     default_severity = Severity.CRITICAL
 
     def validate(self, dataset: CanonicalDataset, context: RuleContext) -> ValidationResult:
-        raise NotImplementedError("TODO: implement structural.invalid_dtypes")
+        df = dataset.df
+
+        mismatches = {
+            col: {"expected": str(expected_dtype), "actual": str(df.schema[col])}
+            for col, expected_dtype in EXPECTED_DTYPES.items()
+            if col in df.columns and df.schema[col] != expected_dtype
+        }
+
+        if not mismatches:
+            return ValidationResult(
+                rule_id=self.rule_id,
+                rule_name=self.rule_name,
+                category=self.category,
+                severity=self.default_severity,
+                status=Status.PASS,
+                message="All column dtypes match the expected schema.",
+            )
+
+        return ValidationResult(
+            rule_id=self.rule_id,
+            rule_name=self.rule_name,
+            category=self.category,
+            severity=self.default_severity,
+            status=Status.FAIL,
+            message=f"{len(mismatches)} column(s) have unexpected dtypes: {list(mismatches)}",
+            details={"mismatched_columns": mismatches},
+            affected_rows=dataset.row_count,
+        )
 
 
 @register

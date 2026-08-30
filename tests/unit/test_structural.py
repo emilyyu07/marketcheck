@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import polars as pl
 import pytest
 
@@ -29,7 +31,6 @@ ALL_STRUCTURAL_RULES = [
 # Rules that are still stubs — used to assert NotImplementedError is raised.
 STUB_STRUCTURAL_RULES = [
     DuplicateTimestamps,
-    InvalidDtypes,
     UnsortedTimestamps,
     NullValues,
 ]
@@ -40,8 +41,12 @@ STUB_STRUCTURAL_RULES = [
 # ---------------------------------------------------------------------------
 
 def _make_dataset(df: pl.DataFrame) -> CanonicalDataset:
-    """Wrap a DataFrame in a CanonicalDataset with a dummy source path."""
-    return CanonicalDataset(df=df, source_path="test.csv")
+    """Wrap a DataFrame in a CanonicalDataset with a dummy source path.
+
+    row_count is populated from len(df) so that rules using dataset.row_count
+    for affected_rows (e.g. InvalidDtypes) behave correctly in tests.
+    """
+    return CanonicalDataset(df=df, source_path="test.csv", row_count=len(df))
 
 
 def _make_context() -> RuleContext:
@@ -74,13 +79,13 @@ class TestStructuralRulesRegistered:
 
 
 # ---------------------------------------------------------------------------
-# Rule 1: MissingColumns — full test suite
+# MissingColumns — full test suite
 # ---------------------------------------------------------------------------
 
 class TestMissingColumns:
     """Tests for the MissingColumns validation rule."""
 
-    # PASS cases — all required columns must be present, extra columns are ignored
+    # --- PASS cases ---------------------------------------------------------
 
     def test_pass_all_required_columns_present(self, sample_ohlcv_df: pl.DataFrame) -> None:
         """All 6 required columns present → PASS."""
@@ -99,7 +104,7 @@ class TestMissingColumns:
 
         assert result.status == Status.PASS
 
-    # FAIL cases — missing columns must be reported in details and message
+    # --- FAIL cases ---------------------------------------------------------
 
     def test_fail_single_missing_column(self, sample_ohlcv_df: pl.DataFrame) -> None:
         """Dropping one column → FAIL with exactly that column reported."""
@@ -128,7 +133,7 @@ class TestMissingColumns:
         assert len(result.details["missing_columns"]) == 6
         assert result.affected_rows == 0
 
-    # Message format checks
+    # --- Message format checks ----------------------------------------------
 
     def test_fail_message_contains_count_and_names(self, sample_ohlcv_df: pl.DataFrame) -> None:
         """Failure message must contain the count and the missing column names."""
@@ -145,3 +150,96 @@ class TestMissingColumns:
 
         assert result.message
         assert "present" in result.message.lower()
+
+
+# ---------------------------------------------------------------------------
+# InvalidDtypes — full test suite
+# ---------------------------------------------------------------------------
+
+class TestInvalidDtypes:
+    """Tests for the InvalidDtypes validation rule."""
+
+    # --- PASS cases ---------------------------------------------------------
+
+    def test_pass_correct_dtypes(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """Standard sample DataFrame has correct dtypes → PASS."""
+        result = InvalidDtypes().validate(_make_dataset(sample_ohlcv_df), _make_context())
+
+        assert result.status == Status.PASS
+        assert result.rule_id == "structural.invalid_dtypes"
+        assert result.severity == Severity.CRITICAL
+        assert result.details == {}
+
+    def test_pass_extra_columns_are_ignored(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """Extra columns with any dtype must not cause a failure."""
+        df = sample_ohlcv_df.with_columns(pl.lit("AAPL").alias("ticker"))
+        result = InvalidDtypes().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+
+    def test_pass_missing_column_not_reported(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """A missing column must be skipped, not treated as a dtype mismatch.
+
+        MissingColumns owns absent columns; InvalidDtypes must not double-report.
+        """
+        df = sample_ohlcv_df.drop("volume")
+        result = InvalidDtypes().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+        assert "volume" not in str(result.details)
+
+    # --- FAIL cases ---------------------------------------------------------
+
+    def test_fail_single_wrong_dtype(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """One column with wrong dtype → FAIL with that column in details."""
+        # Cast volume to Float64 to simulate a column that wasn't coerced correctly.
+        df = sample_ohlcv_df.with_columns(pl.col("volume").cast(pl.Float64))
+        result = InvalidDtypes().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.FAIL
+        assert "volume" in result.details["mismatched_columns"]
+        mismatch = result.details["mismatched_columns"]["volume"]
+        assert mismatch["expected"] == "Int64"
+        assert mismatch["actual"] == "Float64"
+
+    def test_fail_multiple_wrong_dtypes(self) -> None:
+        """Multiple wrong dtypes → FAIL with all mismatched columns in details."""
+        df = pl.DataFrame({
+            "timestamp": [datetime(2024, 1, 2, 9, 30)],
+            "open":      ["100.0"],   # String instead of Float64
+            "high":      [100.8],
+            "low":       [99.5],
+            "close":     [100.5],
+            "volume":    [1000.0],    # Float64 instead of Int64
+        })
+        result = InvalidDtypes().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.FAIL
+        mismatches = result.details["mismatched_columns"]
+        assert "open" in mismatches
+        assert "volume" in mismatches
+        assert mismatches["volume"]["expected"] == "Int64"
+        assert mismatches["volume"]["actual"] == "Float64"
+
+    def test_fail_affected_rows_equals_row_count(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """affected_rows must equal the total dataset row count.
+
+        Every row carries a wrong-typed value when a column dtype is wrong.
+        """
+        df = sample_ohlcv_df.with_columns(pl.col("volume").cast(pl.Float64))
+        result = InvalidDtypes().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.FAIL
+        assert result.affected_rows == len(sample_ohlcv_df)  # 10
+
+    # --- Message format checks ----------------------------------------------
+
+    def test_fail_message_contains_count_and_column_names(
+        self, sample_ohlcv_df: pl.DataFrame
+    ) -> None:
+        """Failure message must contain the mismatch count and column names."""
+        df = sample_ohlcv_df.with_columns(pl.col("volume").cast(pl.Float64))
+        result = InvalidDtypes().validate(_make_dataset(df), _make_context())
+
+        assert "1" in result.message
+        assert "volume" in result.message
