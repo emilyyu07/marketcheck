@@ -1,4 +1,7 @@
-"""Canonicalize raw DataFrames into CanonicalDataset instances."""
+"""
+Canonicalize raw DataFrames into CanonicalDataset instances.
+Assemble all raw DataFrames and metadata into a single canonical model for validation.
+"""
 
 from __future__ import annotations
 
@@ -35,6 +38,7 @@ def to_canonical(df: pl.DataFrame, source_path: str | Path) -> CanonicalDataset:
         end_time = ts_col.max()
 
     # Attempt to extract ticker from filename
+    # Heuristic: filename is expected to be in the format "TICKER_text.ext"
     ticker = Path(source_path).stem.split("_")[0].upper()
 
     return CanonicalDataset(

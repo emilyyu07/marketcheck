@@ -4,7 +4,14 @@ from enum import Enum
 
 
 class Severity(str, Enum):
-    """How severe a validation finding is."""
+    """
+    How severe a validation finding is.
+
+    Severity belongs to a rule and is static. It describes how bad a finding would be
+    if it occurred (critical indicates data in unusable, warning indicates data is 
+    usable but has potential issues, info indicates data is usable and the finding is 
+    informational).
+    """
 
     INFO = "info"
     WARNING = "warning"
@@ -20,7 +27,12 @@ class Status(str, Enum):
 
 
 class Category(str, Enum):
-    """Classification category for validation rules."""
+    """
+    
+    Classification category for validation rules (what type of data they validate, i.e. 
+    shape/columns, time, numbers, market specific concepts).
+    
+    """
 
     STRUCTURAL = "structural"
     TEMPORAL = "temporal"

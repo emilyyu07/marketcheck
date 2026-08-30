@@ -1,4 +1,7 @@
-"""Plain-text report renderer."""
+"""
+Plain-text report renderer.
+Takes a DatasetSummary and produces a human-readable text report in string format
+"""
 
 from __future__ import annotations
 

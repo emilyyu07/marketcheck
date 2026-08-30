@@ -1,4 +1,8 @@
-"""File loaders for CSV and Parquet data sources."""
+"""
+    File loaders for CSV and Parquet data sources.
+    Checks if file exists and raises appropriate exceptions if not.
+    Uses Polars for efficient data loading and parsing.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +10,7 @@ from pathlib import Path
 
 import polars as pl
 
-
+# for CSV files
 def load_csv(path: str | Path) -> pl.DataFrame:
     """Load a CSV file into a Polars DataFrame.
 
@@ -28,7 +32,7 @@ def load_csv(path: str | Path) -> pl.DataFrame:
     except Exception as exc:
         raise ValueError(f"Failed to parse CSV file {path}: {exc}") from exc
 
-
+# for parquet files
 def load_parquet(path: str | Path) -> pl.DataFrame:
     """Load a Parquet file into a Polars DataFrame.
 

@@ -1,4 +1,4 @@
-"""Base validation rule interface, registry, and decorator."""
+"""Base validation rule interface, registry, and decorator (core data contracts)"""
 
 from __future__ import annotations
 

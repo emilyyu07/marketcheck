@@ -1,4 +1,4 @@
-"""Validation configuration model."""
+"""Validation configuration model"""
 
 from __future__ import annotations
 

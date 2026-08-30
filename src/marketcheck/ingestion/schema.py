@@ -43,6 +43,7 @@ def coerce_dtypes(df: pl.DataFrame) -> pl.DataFrame:
     # Normalize column names to lowercase
     df = df.rename({col: col.strip().lower() for col in df.columns})
 
+    # raise if any required columns are missing (each rule depends on all columns existing)
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")

@@ -25,3 +25,6 @@ htmlcov/
 # Generated test fixtures
 tests/fixtures/*.parquet
 tests/fixtures/*.csv
+
+# Planning docs
+marketcheck-scaffold-spec.md

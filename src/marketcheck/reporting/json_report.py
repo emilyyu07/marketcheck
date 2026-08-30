@@ -1,4 +1,7 @@
-"""JSON report renderer."""
+"""
+JSON report renderer
+Takes a DatasetSummary and produces a human-readable report in JSON format
+"""
 
 from __future__ import annotations
 

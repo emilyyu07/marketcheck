@@ -1,4 +1,4 @@
-"""Aggregator — combines individual rule results into a DatasetSummary."""
+"""Aggregator: combines individual rule results into a DatasetSummary (result summary)"""
 
 from __future__ import annotations
 

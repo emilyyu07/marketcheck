@@ -1,4 +1,4 @@
-"""Validation runner — iterates registered rules and collects results."""
+"""Validation runner — iterates registered rules and collects results (rule execution)"""
 
 from __future__ import annotations
 
@@ -19,8 +19,8 @@ def run_validation(
 ) -> list[ValidationResult]:
     """Run all registered validation rules against *dataset*.
 
-    Rules that raise ``NotImplementedError`` are skipped with a warning,
-    so the pipeline works end-to-end even before rules are implemented.
+    This function iterates through all registered validation rules and applies them to the provided dataset.
+    It collects the results of each rule's execution and returns a list of validation results.
 
     Args:
         dataset: The canonical dataset to validate.

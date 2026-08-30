@@ -1,4 +1,8 @@
-"""Thin wrapper around pandas_market_calendars for NYSE session info."""
+"""
+Thin wrapper around pandas_market_calendars for NYSE session info.
+Provides NYSE market awareness (i.e. valid trading days, open/close times) to validators.
+
+"""
 
 from __future__ import annotations
 
