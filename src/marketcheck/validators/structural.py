@@ -6,10 +6,12 @@ including required columns, data types, and timestamp ordering.
 
 Rule 1: MissingColumns
 Rule 2: InvalidDTypes
-Rule 3:
+Rule 3: UnsortedTimestamps
 Rule 4:
 Rule 5:
 """
+
+import polars as pl
 
 from marketcheck.ingestion.schema import EXPECTED_DTYPES, REQUIRED_COLUMNS
 from marketcheck.models.dataset import CanonicalDataset
@@ -108,6 +110,15 @@ class InvalidDtypes(ValidationRule):
         )
 
 
+'''
+Rule 3: Unsorted Timestamps
+Checks if the timestamps in the dataset are sorted in strictly ascending order.
+If any timestamp is not in strictly ascending order, the rule fails.
+Only STRICT decreases (timestamp[i] < timestamp[i-1]) are flagged. 
+
+Key notes:
+Equal consecutive timestamps (ties), absent timestamp columns, and null timestamps are NOT flagged here
+'''
 @register
 class UnsortedTimestamps(ValidationRule):
     rule_id = "structural.unsorted_timestamps"
@@ -116,7 +127,82 @@ class UnsortedTimestamps(ValidationRule):
     default_severity = Severity.WARNING
 
     def validate(self, dataset: CanonicalDataset, context: RuleContext) -> ValidationResult:
-        raise NotImplementedError("TODO: implement structural.unsorted_timestamps")
+        df = dataset.df
+
+        # MissingColumns owns absent columns; skip rather than crash or double-report.
+        if "timestamp" not in df.columns:
+            return ValidationResult(
+                rule_id=self.rule_id,
+                rule_name=self.rule_name,
+                category=self.category,
+                severity=self.default_severity,
+                status=Status.PASS,
+                message="No timestamp column present; skipped.",
+            )
+
+        # Trivially sorted with 0 or 1 rows -- nothing to compare.
+        if df.height < 2:
+            return ValidationResult(
+                rule_id=self.rule_id,
+                rule_name=self.rule_name,
+                category=self.category,
+                severity=self.default_severity,
+                status=Status.PASS,
+                message="Timestamps are sorted in ascending order.",
+            )
+
+        # Vectorized pass: pair each row with its predecessor via shift(1),
+        # then keep only rows where a strict decrease occurred. Nulls on either
+        # side make the comparison null (not True), so they're excluded
+        # automatically without extra filtering logic.
+        violations_df = (
+            df.select(
+                pl.int_range(0, df.height).alias("index"),
+                pl.col("timestamp").alias("current_timestamp"),
+                pl.col("timestamp").shift(1).alias("previous_timestamp"),
+            )
+            .filter(pl.col("current_timestamp") < pl.col("previous_timestamp"))
+        )
+
+        violation_count = violations_df.height
+
+        if violation_count == 0:
+            return ValidationResult(
+                rule_id=self.rule_id,
+                rule_name=self.rule_name,
+                category=self.category,
+                severity=self.default_severity,
+                status=Status.PASS,
+                message="Timestamps are sorted in ascending order.",
+            )
+
+        capped = violations_df.head(context.config.max_rows_in_details)
+        violations = [
+            {
+                "index": row["index"],
+                "previous_timestamp": row["previous_timestamp"],
+                "current_timestamp": row["current_timestamp"],
+            }
+            for row in capped.iter_rows(named=True)
+        ]
+
+        first = violations[0]
+        message = (
+            f"{violation_count} row(s) out of order "
+            f"(first at index {first['index']}: "
+            f"{first['previous_timestamp']} -> {first['current_timestamp']})."
+        )
+
+        return ValidationResult(
+            rule_id=self.rule_id,
+            rule_name=self.rule_name,
+            category=self.category,
+            severity=self.default_severity,
+            status=Status.WARN,
+            message=message,
+            details={"violations": violations},
+            affected_rows=violation_count,
+        )
 
 
 @register

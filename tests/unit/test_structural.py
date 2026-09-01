@@ -7,6 +7,7 @@ from datetime import datetime
 import polars as pl
 import pytest
 
+from marketcheck.models.config import ValidationConfig
 from marketcheck.models.dataset import CanonicalDataset
 from marketcheck.models.enums import Category, Severity, Status
 from marketcheck.validators import REGISTRY
@@ -31,7 +32,6 @@ ALL_STRUCTURAL_RULES = [
 # Rules that are still stubs — used to assert NotImplementedError is raised.
 STUB_STRUCTURAL_RULES = [
     DuplicateTimestamps,
-    UnsortedTimestamps,
     NullValues,
 ]
 
@@ -243,3 +243,150 @@ class TestInvalidDtypes:
 
         assert "1" in result.message
         assert "volume" in result.message
+
+
+# ---------------------------------------------------------------------------
+# UnsortedTimestamps — full test suite
+# ---------------------------------------------------------------------------
+
+class TestUnsortedTimestamps:
+    """Tests for the UnsortedTimestamps validation rule."""
+
+    # --- PASS cases ---------------------------------------------------------
+
+    def test_pass_already_sorted(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """The standard ascending-order fixture must PASS."""
+        result = UnsortedTimestamps().validate(_make_dataset(sample_ohlcv_df), _make_context())
+
+        assert result.status == Status.PASS
+        assert result.rule_id == "structural.unsorted_timestamps"
+        assert result.severity == Severity.WARNING
+        assert result.affected_rows == 0
+        assert result.details == {}
+
+    def test_pass_empty_dataset(self) -> None:
+        """Zero rows means nothing to compare -> PASS."""
+        df = pl.DataFrame({"timestamp": []}, schema={"timestamp": pl.Datetime("us")})
+        result = UnsortedTimestamps().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+
+    def test_pass_single_row(self) -> None:
+        """A single row has no predecessor to violate order against -> PASS."""
+        df = pl.DataFrame({"timestamp": [datetime(2024, 1, 2, 9, 30)]})
+        result = UnsortedTimestamps().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+
+    def test_pass_timestamp_column_missing(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """No timestamp column -> PASS (skip); MissingColumns owns this concern."""
+        df = sample_ohlcv_df.drop("timestamp")
+        result = UnsortedTimestamps().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+
+    def test_pass_duplicate_timestamps_not_flagged(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """Equal consecutive timestamps (ties) are DuplicateTimestamps' concern, not ours."""
+        df = sample_ohlcv_df.with_columns(
+            pl.when(pl.int_range(0, sample_ohlcv_df.height) == 1)
+            .then(pl.col("timestamp").first())
+            .otherwise(pl.col("timestamp"))
+            .alias("timestamp")
+        )
+        result = UnsortedTimestamps().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+
+    def test_pass_nulls_excluded_from_comparison(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """A null timestamp must not trigger a false violation on either side of it."""
+        df = sample_ohlcv_df.with_columns(
+            pl.when(pl.int_range(0, sample_ohlcv_df.height) == 3)
+            .then(None)
+            .otherwise(pl.col("timestamp"))
+            .alias("timestamp")
+        )
+        result = UnsortedTimestamps().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+
+    # --- WARN cases ----------------------------------------------------------
+
+    def test_warn_single_out_of_order_row(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """Swapping two adjacent timestamps produces exactly one violation."""
+        ts = sample_ohlcv_df["timestamp"].to_list()
+        ts[3], ts[4] = ts[4], ts[3]
+        df = sample_ohlcv_df.with_columns(pl.Series("timestamp", ts))
+
+        result = UnsortedTimestamps().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.WARN
+        assert result.severity == Severity.WARNING
+        assert result.affected_rows == 1
+
+    def test_warn_multiple_out_of_order_rows(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """Multiple independent swaps produce a matching violation count."""
+        ts = sample_ohlcv_df["timestamp"].to_list()
+        ts[2], ts[3] = ts[3], ts[2]
+        ts[6], ts[7] = ts[7], ts[6]
+        df = sample_ohlcv_df.with_columns(pl.Series("timestamp", ts))
+
+        result = UnsortedTimestamps().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.WARN
+        assert result.affected_rows == 2
+
+    def test_warn_details_capped_at_max_rows_in_details(
+        self, sample_ohlcv_df: pl.DataFrame
+    ) -> None:
+        """details['violations'] is capped by config.max_rows_in_details,
+        but affected_rows still reflects the full violation count."""
+        # Reverse the whole series: every adjacent pair after the first becomes
+        # a violation (9 violations across 10 rows).
+        ts = list(reversed(sample_ohlcv_df["timestamp"].to_list()))
+        df = sample_ohlcv_df.with_columns(pl.Series("timestamp", ts))
+
+        context = RuleContext(config=ValidationConfig(max_rows_in_details=2))
+        result = UnsortedTimestamps().validate(_make_dataset(df), context)
+
+        assert result.status == Status.WARN
+        assert result.affected_rows == 9
+        assert len(result.details["violations"]) == 2
+
+    def test_warn_violation_index_and_timestamps_correct(
+        self, sample_ohlcv_df: pl.DataFrame
+    ) -> None:
+        """The reported index/previous/current values must match the 0-based
+        convention: index is the row that broke order (the later row)."""
+        ts = sample_ohlcv_df["timestamp"].to_list()
+        original_3, original_4 = ts[3], ts[4]
+        ts[3], ts[4] = ts[4], ts[3]
+        df = sample_ohlcv_df.with_columns(pl.Series("timestamp", ts))
+
+        result = UnsortedTimestamps().validate(_make_dataset(df), _make_context())
+
+        violation = result.details["violations"][0]
+        assert violation["index"] == 4
+        assert violation["previous_timestamp"] == original_4  # now at index 3
+        assert violation["current_timestamp"] == original_3   # now at index 4
+
+    # --- Message format checks ------------------------------------------------
+
+    def test_warn_message_contains_count_and_first_violation(
+        self, sample_ohlcv_df: pl.DataFrame
+    ) -> None:
+        """Message must contain the violation count and the first violation's index."""
+        ts = sample_ohlcv_df["timestamp"].to_list()
+        ts[3], ts[4] = ts[4], ts[3]
+        df = sample_ohlcv_df.with_columns(pl.Series("timestamp", ts))
+
+        result = UnsortedTimestamps().validate(_make_dataset(df), _make_context())
+
+        assert "1" in result.message
+        assert "index 4" in result.message
+
+    def test_pass_message_is_informative(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """Pass message must be non-empty and describe the outcome."""
+        result = UnsortedTimestamps().validate(_make_dataset(sample_ohlcv_df), _make_context())
+
+        assert result.message
+        assert "sorted" in result.message.lower()
