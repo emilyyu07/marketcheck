@@ -114,10 +114,11 @@ class InvalidDtypes(ValidationRule):
 Rule 3: Unsorted Timestamps
 Checks if the timestamps in the dataset are sorted in strictly ascending order.
 If any timestamp is not in strictly ascending order, the rule fails.
-Only STRICT decreases (timestamp[i] < timestamp[i-1]) are flagged. 
+Only STRICT decreases (timestamp[i] < timestamp[i-1]) are flagged.
 
 Key notes:
-Equal consecutive timestamps (ties), absent timestamp columns, and null timestamps are NOT flagged here
+Equal consecutive timestamps (ties), absent timestamp columns, and null
+timestamps are NOT flagged here.
 '''
 @register
 class UnsortedTimestamps(ValidationRule):
@@ -204,7 +205,30 @@ class UnsortedTimestamps(ValidationRule):
             affected_rows=violation_count,
         )
 
+'''
+Rule 4: Null / Missing Values
+Checks if any required columns contain null or missing values.
+If any required columns contain null values, the rule fails.
+'''
+'''
+Rule 5: Null / Missing Values
+Checks the 6 required OHLCV columns (timestamp, open, high, low, close, volume)
+for null values.
 
+Scope: only REQUIRED_COLUMNS are checked; any extra columns present in the
+DataFrame are ignored (out of the canonical OHLCV contract this tool validates).
+
+If a required column is entirely absent from the DataFrame, it is silently
+skipped here rather than reported or causing a crash -- MissingColumns already
+owns reporting column absence, and this rule must not double-report or treat
+absence as "all null."
+
+Severity is a single, uniform WARNING for the whole rule regardless of which
+column(s) have nulls (this codebase's ValidationRule has one default_severity
+per rule, not per-finding). A null timestamp arguably deserves harsher
+treatment than a null volume, but introducing per-column severity would be a
+first-of-its-kind pattern here -- deferred; see PROJECT_STATUS.md.
+'''
 @register
 class NullValues(ValidationRule):
     rule_id = "structural.null_values"
@@ -213,4 +237,60 @@ class NullValues(ValidationRule):
     default_severity = Severity.WARNING
 
     def validate(self, dataset: CanonicalDataset, context: RuleContext) -> ValidationResult:
-        raise NotImplementedError("TODO: implement structural.null_values")
+        df = dataset.df
+
+        # MissingColumns owns absent columns; only check columns that exist.
+        checked_cols = [col for col in REQUIRED_COLUMNS if col in df.columns]
+
+        # Guard: if none of the required columns exist, there's nothing to
+        # check -- PASS trivially rather than depending on unverified
+        # pl.any_horizontal([]) behavior on an empty expression list.
+        if not checked_cols:
+            return ValidationResult(
+                rule_id=self.rule_id,
+                rule_name=self.rule_name,
+                category=self.category,
+                severity=self.default_severity,
+                status=Status.PASS,
+                message="No null values found in required columns.",
+            )
+
+        # Per-column null counts -- only columns with at least one null.
+        null_counts = {
+            col: count
+            for col in checked_cols
+            if (count := df[col].null_count()) > 0
+        }
+
+        if not null_counts:
+            return ValidationResult(
+                rule_id=self.rule_id,
+                rule_name=self.rule_name,
+                category=self.category,
+                severity=self.default_severity,
+                status=Status.PASS,
+                message="No null values found in required columns.",
+            )
+
+        # Row-level count: rows with a null in ANY checked column, counted once
+        # each (not once per affected column). Single vectorized pass.
+        any_null_expr = pl.any_horizontal(
+            [pl.col(col).is_null() for col in checked_cols]
+        )
+        affected_rows = df.select(any_null_expr.sum()).item()
+
+        message = (
+            f"{len(null_counts)} column(s) contain null values, "
+            f"affecting {affected_rows} row(s): {null_counts}."
+        )
+
+        return ValidationResult(
+            rule_id=self.rule_id,
+            rule_name=self.rule_name,
+            category=self.category,
+            severity=self.default_severity,
+            status=Status.WARN,
+            message=message,
+            details={"null_counts": null_counts},
+            affected_rows=affected_rows,
+        )

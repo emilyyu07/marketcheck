@@ -28,3 +28,4 @@ tests/fixtures/*.csv
 
 # Planning docs
 marketcheck-scaffold-spec.md
+PROJECT_STATUS.md

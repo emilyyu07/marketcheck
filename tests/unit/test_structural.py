@@ -32,7 +32,6 @@ ALL_STRUCTURAL_RULES = [
 # Rules that are still stubs — used to assert NotImplementedError is raised.
 STUB_STRUCTURAL_RULES = [
     DuplicateTimestamps,
-    NullValues,
 ]
 
 
@@ -390,3 +389,219 @@ class TestUnsortedTimestamps:
 
         assert result.message
         assert "sorted" in result.message.lower()
+
+
+# ---------------------------------------------------------------------------
+# NullValues — full test suite
+# ---------------------------------------------------------------------------
+
+class TestNullValues:
+    """Tests for the NullValues validation rule."""
+
+    # --- PASS cases ---------------------------------------------------------
+
+    def test_pass_no_nulls(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """The standard fixture has no nulls -> PASS."""
+        result = NullValues().validate(_make_dataset(sample_ohlcv_df), _make_context())
+
+        assert result.status == Status.PASS
+        assert result.rule_id == "structural.null_values"
+        assert result.severity == Severity.WARNING
+        assert result.affected_rows == 0
+        assert result.details == {}
+
+    def test_pass_empty_dataset(self) -> None:
+        """Zero rows means zero nulls by construction -> PASS."""
+        df = pl.DataFrame(
+            {
+                "timestamp": [],
+                "open": [],
+                "high": [],
+                "low": [],
+                "close": [],
+                "volume": [],
+            },
+            schema={
+                "timestamp": pl.Datetime("us"),
+                "open": pl.Float64,
+                "high": pl.Float64,
+                "low": pl.Float64,
+                "close": pl.Float64,
+                "volume": pl.Int64,
+            },
+        )
+        result = NullValues().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+
+    def test_pass_all_required_columns_missing(self) -> None:
+        """No required columns present -> PASS via the empty-checked-columns guard,
+        not treated as 'everything is null'. MissingColumns owns this case."""
+        df = pl.DataFrame({"ticker": ["AAPL", "AAPL"]})
+        result = NullValues().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+        assert result.affected_rows == 0
+        assert result.details == {}
+
+    def test_pass_extra_column_nulls_ignored(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """A null in a non-required extra column is out of scope -> PASS."""
+        df = sample_ohlcv_df.with_columns(pl.lit(None, dtype=pl.Utf8).alias("ticker"))
+        result = NullValues().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+
+    # --- WARN cases ----------------------------------------------------------
+
+    def test_warn_single_column_single_null(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """One null in one column -> WARN, affected_rows == 1."""
+        volume = sample_ohlcv_df["volume"].to_list()
+        volume[2] = None
+        df = sample_ohlcv_df.with_columns(pl.Series("volume", volume, dtype=pl.Int64))
+
+        result = NullValues().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.WARN
+        assert result.severity == Severity.WARNING
+        assert result.affected_rows == 1
+        assert result.details["null_counts"] == {"volume": 1}
+
+    def test_warn_single_column_multiple_nulls(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """Multiple nulls in one column -> affected_rows equals that count."""
+        volume = sample_ohlcv_df["volume"].to_list()
+        volume[2] = None
+        volume[5] = None
+        volume[7] = None
+        df = sample_ohlcv_df.with_columns(pl.Series("volume", volume, dtype=pl.Int64))
+
+        result = NullValues().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.WARN
+        assert result.affected_rows == 3
+        assert result.details["null_counts"] == {"volume": 3}
+
+    def test_warn_multiple_columns_same_row(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """Nulls in two columns on the SAME row -> affected_rows == 1, not 2.
+
+        This is the key behavior locking in the any_horizontal (distinct-rows)
+        design over a naive sum-of-per-column-counts approach.
+        """
+        volume = sample_ohlcv_df["volume"].to_list()
+        close = sample_ohlcv_df["close"].to_list()
+        volume[4] = None
+        close[4] = None
+        df = sample_ohlcv_df.with_columns(
+            pl.Series("volume", volume, dtype=pl.Int64),
+            pl.Series("close", close, dtype=pl.Float64),
+        )
+
+        result = NullValues().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.WARN
+        assert result.affected_rows == 1
+        assert result.details["null_counts"] == {"volume": 1, "close": 1}
+
+    def test_warn_multiple_columns_different_rows(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """Nulls in two columns on DIFFERENT rows -> affected_rows == 2."""
+        volume = sample_ohlcv_df["volume"].to_list()
+        close = sample_ohlcv_df["close"].to_list()
+        volume[2] = None
+        close[6] = None
+        df = sample_ohlcv_df.with_columns(
+            pl.Series("volume", volume, dtype=pl.Int64),
+            pl.Series("close", close, dtype=pl.Float64),
+        )
+
+        result = NullValues().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.WARN
+        assert result.affected_rows == 2
+        assert result.details["null_counts"] == {"volume": 1, "close": 1}
+
+    def test_warn_null_counts_shape_and_filtering(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """details['null_counts'] must only include columns with count > 0."""
+        volume = sample_ohlcv_df["volume"].to_list()
+        volume[0] = None
+        df = sample_ohlcv_df.with_columns(pl.Series("volume", volume, dtype=pl.Int64))
+
+        result = NullValues().validate(_make_dataset(df), _make_context())
+
+        assert set(result.details["null_counts"].keys()) == {"volume"}
+        assert "open" not in result.details["null_counts"]
+
+    def test_warn_null_timestamp_is_reported(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """A null in 'timestamp' itself is in scope for this rule.
+
+        UnsortedTimestamps explicitly defers reporting null timestamps to
+        NullValues; this test confirms that promise is kept.
+        """
+        ts = sample_ohlcv_df["timestamp"].to_list()
+        ts[3] = None
+        df = sample_ohlcv_df.with_columns(pl.Series("timestamp", ts))
+
+        result = NullValues().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.WARN
+        assert result.details["null_counts"]["timestamp"] == 1
+        assert result.affected_rows == 1
+
+    def test_warn_entire_column_null(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """A fully-null column (every row) must be handled without error,
+        with null_counts and affected_rows reflecting the full row count."""
+        df = sample_ohlcv_df.with_columns(
+            pl.lit(None, dtype=pl.Int64).alias("volume")
+        )
+
+        result = NullValues().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.WARN
+        assert result.details["null_counts"]["volume"] == len(sample_ohlcv_df)
+        assert result.affected_rows == len(sample_ohlcv_df)
+
+    def test_warn_unparseable_source_value_reported_as_null(self) -> None:
+        """Documents a known limitation: coerce_dtypes() casts numeric columns
+        with strict=False, so an unparseable source value (e.g. a non-numeric
+        string in a numeric column) is silently converted to null during
+        ingestion. NullValues cannot distinguish that from a genuinely absent
+        source value -- both look identical by the time this rule runs.
+        See PROJECT_STATUS.md for further discussion.
+        """
+        from marketcheck.ingestion.schema import coerce_dtypes
+
+        raw = pl.DataFrame(
+            {
+                "timestamp": [datetime(2024, 1, 2, 9, 30), datetime(2024, 1, 2, 9, 31)],
+                "open": ["100.0", "N/A"],  # "N/A" cannot parse as Float64
+                "high": [100.8, 101.0],
+                "low": [99.5, 100.5],
+                "close": [100.5, 100.8],
+                "volume": [1000, 1100],
+            }
+        )
+        df = coerce_dtypes(raw)
+        result = NullValues().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.WARN
+        assert result.details["null_counts"]["open"] == 1
+
+    # --- Message format checks ------------------------------------------------
+
+    def test_warn_message_contains_column_count_and_row_count(
+        self, sample_ohlcv_df: pl.DataFrame
+    ) -> None:
+        """Message must lead with column count, then row-level impact."""
+        volume = sample_ohlcv_df["volume"].to_list()
+        volume[2] = None
+        df = sample_ohlcv_df.with_columns(pl.Series("volume", volume, dtype=pl.Int64))
+
+        result = NullValues().validate(_make_dataset(df), _make_context())
+
+        assert "1" in result.message
+        assert "volume" in result.message
+
+    def test_pass_message_is_informative(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """Pass message must be non-empty and describe the outcome."""
+        result = NullValues().validate(_make_dataset(sample_ohlcv_df), _make_context())
+
+        assert result.message
+        assert "null" in result.message.lower()
