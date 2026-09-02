@@ -7,8 +7,8 @@ including required columns, data types, and timestamp ordering.
 Rule 1: MissingColumns
 Rule 2: InvalidDTypes
 Rule 3: UnsortedTimestamps
-Rule 4:
-Rule 5:
+Rule 4: DuplicateTimestamps
+Rule 5: NullValues
 """
 
 import polars as pl
@@ -20,20 +20,11 @@ from marketcheck.models.result import ValidationResult
 from marketcheck.validators.base import RuleContext, ValidationRule, register
 
 
-@register
-class DuplicateTimestamps(ValidationRule):
-    rule_id = "structural.duplicate_timestamps"
-    rule_name = "Duplicate Timestamps"
-    category = Category.STRUCTURAL
-    default_severity = Severity.CRITICAL
-
-    def validate(self, dataset: CanonicalDataset, context: RuleContext) -> ValidationResult:
-        raise NotImplementedError("TODO: implement structural.duplicate_timestamps")
-
 '''
 Rule 1: Missing Required Columns
 Checks if the dataset contains all required columns. 
 If any required columns are missing, the rule fails.
+Produces CRITICAL severity regardless of which column(s) are missing.
 '''
 @register
 class MissingColumns(ValidationRule):
@@ -71,6 +62,7 @@ class MissingColumns(ValidationRule):
 Rule 2: Invalid Data Types
 Checks if the dataset columns have the expected data types.
 If any column has an unexpected data type, the rule fails.
+Produces CRITICAL severity regardless of which column(s) have unexpected data types.
 '''
 @register
 class InvalidDtypes(ValidationRule):
@@ -115,6 +107,7 @@ Rule 3: Unsorted Timestamps
 Checks if the timestamps in the dataset are sorted in strictly ascending order.
 If any timestamp is not in strictly ascending order, the rule fails.
 Only STRICT decreases (timestamp[i] < timestamp[i-1]) are flagged.
+Produces WARNING severity regardless of which row(s) are out of order.
 
 Key notes:
 Equal consecutive timestamps (ties), absent timestamp columns, and null
@@ -206,28 +199,10 @@ class UnsortedTimestamps(ValidationRule):
         )
 
 '''
-Rule 4: Null / Missing Values
+Rule 5: Null / Missing Values 
 Checks if any required columns contain null or missing values.
 If any required columns contain null values, the rule fails.
-'''
-'''
-Rule 5: Null / Missing Values
-Checks the 6 required OHLCV columns (timestamp, open, high, low, close, volume)
-for null values.
-
-Scope: only REQUIRED_COLUMNS are checked; any extra columns present in the
-DataFrame are ignored (out of the canonical OHLCV contract this tool validates).
-
-If a required column is entirely absent from the DataFrame, it is silently
-skipped here rather than reported or causing a crash -- MissingColumns already
-owns reporting column absence, and this rule must not double-report or treat
-absence as "all null."
-
-Severity is a single, uniform WARNING for the whole rule regardless of which
-column(s) have nulls (this codebase's ValidationRule has one default_severity
-per rule, not per-finding). A null timestamp arguably deserves harsher
-treatment than a null volume, but introducing per-column severity would be a
-first-of-its-kind pattern here -- deferred; see PROJECT_STATUS.md.
+Produces WARNING severity regardless of which column(s) have nulls.
 '''
 @register
 class NullValues(ValidationRule):
@@ -292,5 +267,118 @@ class NullValues(ValidationRule):
             status=Status.WARN,
             message=message,
             details={"null_counts": null_counts},
+            affected_rows=affected_rows,
+        )
+
+
+'''
+Rule 4: Duplicate Timestamps
+Checks whether any timestamp value appears on more than one row, anywhere in
+the dataset.
+Produces CRITICAL severity regardless of which row(s) are affected or how many
+distinct duplicated values exist.
+
+Key notes:
+- UnsortedTimestamps explicitly excludes ties (equal consecutive timestamps)
+  from its own scope specifically so this rule can own them without
+  double-reporting.
+- Null timestamps are excluded from consideration (NullValues owns nulls);
+  multiple nulls are not treated as duplicates of each other.
+- affected_rows counts individual rows participating in some duplicated
+  value, not the number of distinct duplicated values.
+'''
+@register
+class DuplicateTimestamps(ValidationRule):
+    rule_id = "structural.duplicate_timestamps"
+    rule_name = "Duplicate Timestamps"
+    category = Category.STRUCTURAL
+    default_severity = Severity.CRITICAL
+
+    def validate(self, dataset: CanonicalDataset, context: RuleContext) -> ValidationResult:
+        df = dataset.df
+
+        # MissingColumns owns absent columns; skip rather than crash or double-report.
+        if "timestamp" not in df.columns:
+            return ValidationResult(
+                rule_id=self.rule_id,
+                rule_name=self.rule_name,
+                category=self.category,
+                severity=self.default_severity,
+                status=Status.PASS,
+                message="No timestamp column present; skipped.",
+            )
+
+        # Trivially no duplicates possible with 0 or 1 rows.
+        if df.height < 2:
+            return ValidationResult(
+                rule_id=self.rule_id,
+                rule_name=self.rule_name,
+                category=self.category,
+                severity=self.default_severity,
+                status=Status.PASS,
+                message="No duplicate timestamps found.",
+            )
+
+        # Attach the original row index before any filtering/grouping, so
+        # reported indices always refer to positions in the real dataset.
+        indexed = df.select(
+            pl.int_range(0, df.height).alias("index"),
+            pl.col("timestamp"),
+        )
+
+        # NullValues owns nulls; exclude them so multiple nulls are never
+        # treated as duplicates of each other.
+        non_null = indexed.filter(pl.col("timestamp").is_not_null())
+
+        # Group by timestamp value and count occurrences anywhere in the
+        # dataset (not just adjacent rows), then keep only groups that repeat.
+        dup_counts = (
+            non_null.group_by("timestamp")
+            .agg(pl.len().alias("count"))
+            .filter(pl.col("count") > 1)
+        )
+
+        if dup_counts.height == 0:
+            return ValidationResult(
+                rule_id=self.rule_id,
+                rule_name=self.rule_name,
+                category=self.category,
+                severity=self.default_severity,
+                status=Status.PASS,
+                message="No duplicate timestamps found.",
+            )
+
+        # Recover every row belonging to a duplicated timestamp value, in
+        # original row order (group_by row order is not guaranteed stable).
+        violations_df = non_null.join(dup_counts, on="timestamp", how="inner").sort("index")
+
+        affected_rows = violations_df.height
+        distinct_duplicated_values = dup_counts.height
+
+        capped = violations_df.head(context.config.max_rows_in_details)
+        violations = [
+            {
+                "index": row["index"],
+                "timestamp": row["timestamp"],
+                "count": row["count"],
+            }
+            for row in capped.iter_rows(named=True)
+        ]
+
+        first = violations[0]
+        message = (
+            f"{affected_rows} row(s) share {distinct_duplicated_values} duplicated "
+            f"timestamp value(s) (first: {first['timestamp']}, "
+            f"appearing {first['count']} time(s))."
+        )
+
+        return ValidationResult(
+            rule_id=self.rule_id,
+            rule_name=self.rule_name,
+            category=self.category,
+            severity=self.default_severity,
+            status=Status.FAIL,
+            message=message,
+            details={"violations": violations},
             affected_rows=affected_rows,
         )
