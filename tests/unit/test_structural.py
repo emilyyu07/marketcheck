@@ -30,9 +30,7 @@ ALL_STRUCTURAL_RULES = [
 ]
 
 # Rules that are still stubs — used to assert NotImplementedError is raised.
-STUB_STRUCTURAL_RULES = [
-    DuplicateTimestamps,
-]
+STUB_STRUCTURAL_RULES: list[type] = []
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +387,216 @@ class TestUnsortedTimestamps:
 
         assert result.message
         assert "sorted" in result.message.lower()
+
+
+# ---------------------------------------------------------------------------
+# DuplicateTimestamps — full test suite
+# ---------------------------------------------------------------------------
+
+class TestDuplicateTimestamps:
+    """Tests for the DuplicateTimestamps validation rule."""
+
+    # --- PASS cases ---------------------------------------------------------
+
+    def test_pass_no_duplicates(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """The standard fixture has all-distinct timestamps -> PASS."""
+        result = DuplicateTimestamps().validate(_make_dataset(sample_ohlcv_df), _make_context())
+
+        assert result.status == Status.PASS
+        assert result.rule_id == "structural.duplicate_timestamps"
+        assert result.severity == Severity.CRITICAL
+        assert result.affected_rows == 0
+        assert result.details == {}
+
+    def test_pass_empty_dataset(self) -> None:
+        """Zero rows means nothing to compare -> PASS."""
+        df = pl.DataFrame({"timestamp": []}, schema={"timestamp": pl.Datetime("us")})
+        result = DuplicateTimestamps().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+
+    def test_pass_single_row(self) -> None:
+        """A single row can't duplicate anything -> PASS."""
+        df = pl.DataFrame({"timestamp": [datetime(2024, 1, 2, 9, 30)]})
+        result = DuplicateTimestamps().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+
+    def test_pass_timestamp_column_missing(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """No timestamp column -> PASS (skip); MissingColumns owns this concern."""
+        df = sample_ohlcv_df.drop("timestamp")
+        result = DuplicateTimestamps().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+
+    def test_pass_multiple_nulls_not_treated_as_duplicates(
+        self, sample_ohlcv_df: pl.DataFrame
+    ) -> None:
+        """Multiple null timestamps must not be flagged as duplicates of each
+        other -- NullValues owns nulls, not this rule."""
+        ts = sample_ohlcv_df["timestamp"].to_list()
+        ts[2] = None
+        ts[5] = None
+        df = sample_ohlcv_df.with_columns(pl.Series("timestamp", ts))
+
+        result = DuplicateTimestamps().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+
+    # --- FAIL cases ----------------------------------------------------------
+
+    def test_fail_single_duplicated_pair(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """Two rows sharing one timestamp value -> FAIL, affected_rows == 2."""
+        ts = sample_ohlcv_df["timestamp"].to_list()
+        ts[5] = ts[2]  # duplicate an earlier timestamp
+        df = sample_ohlcv_df.with_columns(pl.Series("timestamp", ts))
+
+        result = DuplicateTimestamps().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.FAIL
+        assert result.severity == Severity.CRITICAL
+        assert result.affected_rows == 2
+
+    def test_fail_non_adjacent_duplicates_detected(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """Duplicates that are NOT adjacent in row order must still be caught.
+
+        This is the key behavior locking in group_by/count over a
+        shift(1)-based adjacency check: rows 0 and 9 share a value here but
+        are far apart in row order.
+        """
+        ts = sample_ohlcv_df["timestamp"].to_list()
+        ts[9] = ts[0]
+        df = sample_ohlcv_df.with_columns(pl.Series("timestamp", ts))
+
+        result = DuplicateTimestamps().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.FAIL
+        assert result.affected_rows == 2
+        reported_indices = {v["index"] for v in result.details["violations"]}
+        assert reported_indices == {0, 9}
+
+    def test_fail_unsorted_non_adjacent_duplicates_detected(self) -> None:
+        """Duplicates must be found even when the dataset is not sorted --
+        this rule must not depend on UnsortedTimestamps having run or passed.
+        """
+        df = pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime(2024, 1, 2, 9, 30),
+                    datetime(2024, 1, 2, 9, 34),
+                    datetime(2024, 1, 2, 9, 30),  # duplicates row 0, unsorted
+                    datetime(2024, 1, 2, 9, 33),
+                ]
+            }
+        )
+
+        result = DuplicateTimestamps().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.FAIL
+        assert result.affected_rows == 2
+        reported_indices = {v["index"] for v in result.details["violations"]}
+        assert reported_indices == {0, 2}
+
+    def test_fail_three_way_duplicate(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """Three rows sharing one timestamp value -> affected_rows == 3, and
+        each reported violation's count reflects the full group size."""
+        ts = sample_ohlcv_df["timestamp"].to_list()
+        ts[4] = ts[1]
+        ts[7] = ts[1]
+        df = sample_ohlcv_df.with_columns(pl.Series("timestamp", ts))
+
+        result = DuplicateTimestamps().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.FAIL
+        assert result.affected_rows == 3
+        assert all(v["count"] == 3 for v in result.details["violations"])
+
+    def test_fail_multiple_independent_duplicate_groups(
+        self, sample_ohlcv_df: pl.DataFrame
+    ) -> None:
+        """Two separate duplicated timestamp values -> affected_rows counts
+        all rows across both groups (4 total from two pairs)."""
+        ts = sample_ohlcv_df["timestamp"].to_list()
+        ts[5] = ts[2]  # pair 1
+        ts[8] = ts[6]  # pair 2
+        df = sample_ohlcv_df.with_columns(pl.Series("timestamp", ts))
+
+        result = DuplicateTimestamps().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.FAIL
+        assert result.affected_rows == 4
+
+    def test_fail_violations_sorted_by_original_index(
+        self, sample_ohlcv_df: pl.DataFrame
+    ) -> None:
+        """Reported violations must be in original row-index order, not
+        grouped/shuffled order."""
+        ts = sample_ohlcv_df["timestamp"].to_list()
+        ts[8] = ts[1]
+        df = sample_ohlcv_df.with_columns(pl.Series("timestamp", ts))
+
+        result = DuplicateTimestamps().validate(_make_dataset(df), _make_context())
+
+        indices = [v["index"] for v in result.details["violations"]]
+        assert indices == sorted(indices)
+
+    def test_fail_details_capped_at_max_rows_in_details(
+        self, sample_ohlcv_df: pl.DataFrame
+    ) -> None:
+        """details['violations'] is capped by config.max_rows_in_details,
+        but affected_rows still reflects the full violation count."""
+        ts = sample_ohlcv_df["timestamp"].to_list()
+        ts[5] = ts[2]
+        ts[8] = ts[6]
+        df = sample_ohlcv_df.with_columns(pl.Series("timestamp", ts))
+
+        context = RuleContext(config=ValidationConfig(max_rows_in_details=2))
+        result = DuplicateTimestamps().validate(_make_dataset(df), context)
+
+        assert result.status == Status.FAIL
+        assert result.affected_rows == 4
+        assert len(result.details["violations"]) == 2
+
+    def test_fail_null_timestamps_excluded_but_real_duplicates_still_found(
+        self, sample_ohlcv_df: pl.DataFrame
+    ) -> None:
+        """A null timestamp present elsewhere in the data must not interfere
+        with detecting a genuine duplicate among the non-null rows."""
+        ts = sample_ohlcv_df["timestamp"].to_list()
+        ts[3] = None
+        ts[5] = ts[2]
+        df = sample_ohlcv_df.with_columns(pl.Series("timestamp", ts))
+
+        result = DuplicateTimestamps().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.FAIL
+        assert result.affected_rows == 2
+        reported_indices = {v["index"] for v in result.details["violations"]}
+        assert reported_indices == {2, 5}
+
+    # --- Message format checks ------------------------------------------------
+
+    def test_fail_message_contains_row_count_and_first_timestamp(
+        self, sample_ohlcv_df: pl.DataFrame
+    ) -> None:
+        """Message must contain the affected row count and the first
+        duplicated timestamp value."""
+        ts = sample_ohlcv_df["timestamp"].to_list()
+        original = ts[2]
+        ts[5] = original
+        df = sample_ohlcv_df.with_columns(pl.Series("timestamp", ts))
+
+        result = DuplicateTimestamps().validate(_make_dataset(df), _make_context())
+
+        assert "2" in result.message
+        assert str(original) in result.message
+
+    def test_pass_message_is_informative(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """Pass message must be non-empty and describe the outcome."""
+        result = DuplicateTimestamps().validate(_make_dataset(sample_ohlcv_df), _make_context())
+
+        assert result.message
+        assert "duplicate" in result.message.lower()
 
 
 # ---------------------------------------------------------------------------
