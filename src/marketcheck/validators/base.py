@@ -5,6 +5,7 @@ from __future__ import annotations
 import abc
 from dataclasses import dataclass, field
 
+from marketcheck.calendar.sessions import MarketCalendar
 from marketcheck.models.config import ValidationConfig
 from marketcheck.models.dataset import CanonicalDataset
 from marketcheck.models.enums import Category, Severity
@@ -15,11 +16,13 @@ from marketcheck.models.result import ValidationResult
 class RuleContext:
     """Contextual information passed to each rule during validation.
 
-    Will be extended with calendar info, config overrides, etc. as
-    rules are implemented.
+    Constructed once per ``run_validation()`` call and shared across every
+    rule in that run -- so ``calendar`` is built a single time per
+    validation run, not once per rule that needs it.
     """
 
     config: ValidationConfig = field(default_factory=ValidationConfig)
+    calendar: MarketCalendar = field(default_factory=MarketCalendar)
 
 
 class ValidationRule(abc.ABC):
