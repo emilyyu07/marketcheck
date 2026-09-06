@@ -7,7 +7,15 @@ from marketcheck.models.enums import Category, Severity, Status
 from marketcheck.models.result import ValidationResult
 from marketcheck.validators.base import RuleContext, ValidationRule, register
 
+'''
+Rule: Missing Trading Sessions
+Checks whether any NYSE trading session inside the dataset's own date range has
+no rows at all.
 
+Mechanics: expected sessions from context.calendar.valid_sessions(start, end)
+MINUS the set of dates actually present in `timestamp` -> anything left over is
+a session the exchange was open for but the data doesn't cover.
+'''
 @register
 class MissingSessions(ValidationRule):
     rule_id = "temporal.missing_sessions"
@@ -16,7 +24,80 @@ class MissingSessions(ValidationRule):
     default_severity = Severity.WARNING
 
     def validate(self, dataset: CanonicalDataset, context: RuleContext) -> ValidationResult:
-        raise NotImplementedError("TODO: implement temporal.missing_sessions")
+        df = dataset.df
+
+        # MissingColumns owns absent columns; skip rather than crash.
+        if "timestamp" not in df.columns:
+            return ValidationResult(
+                rule_id=self.rule_id,
+                rule_name=self.rule_name,
+                category=self.category,
+                severity=self.default_severity,
+                status=Status.PASS,
+                message="No timestamp column present; skipped.",
+            )
+
+        # NullValues owns nulls; drop them before deriving the date range so a
+        # null can't collapse the range or masquerade as a covered session.
+        dates_present = set(
+            df.select(pl.col("timestamp").dt.date().alias("d"))
+            .drop_nulls()
+            .to_series()
+            .unique()
+            .to_list()
+        )
+
+        # No usable timestamps -> no range to diff over.
+        if not dates_present:
+            return ValidationResult(
+                rule_id=self.rule_id,
+                rule_name=self.rule_name,
+                category=self.category,
+                severity=self.default_severity,
+                status=Status.PASS,
+                message="No trading sessions missing.",
+            )
+
+        start = min(dates_present)
+        end = max(dates_present)
+
+        # Single schedule build for the whole range (already chronological).
+        expected_sessions = context.calendar.valid_sessions(start, end)
+        missing = [d for d in expected_sessions if d not in dates_present]
+
+        if not missing:
+            return ValidationResult(
+                rule_id=self.rule_id,
+                rule_name=self.rule_name,
+                category=self.category,
+                severity=self.default_severity,
+                status=Status.PASS,
+                message="No trading sessions missing.",
+            )
+
+        capped = missing[: context.config.max_rows_in_details]
+        message = (
+            f"{len(missing)} trading session(s) missing between {start} and {end} "
+            f"(first: {missing[0]})."
+        )
+
+        return ValidationResult(
+            rule_id=self.rule_id,
+            rule_name=self.rule_name,
+            category=self.category,
+            severity=self.default_severity,
+            status=Status.WARN,
+            message=message,
+            details={
+                "missing_sessions": [str(d) for d in capped],
+                "missing_count": len(missing),
+                "expected_session_count": len(expected_sessions),
+                "present_session_count": len(dates_present),
+                "range_start": str(start),
+                "range_end": str(end),
+            },
+            affected_rows=0,
+        )
 
 
 @register
