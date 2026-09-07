@@ -134,39 +134,12 @@ class OhlcRangeViolation(ValidationRule):
 
 
 '''
-Rule: Impossible Values  (STUB -- not yet implemented)
+Rule: Impossible Values
 Checks for values that are outright impossible for equity market data, as
 opposed to merely unusual:
-  - any OHLC price <= 0   (a zero or negative price is not a real trade)
-  - volume < 0            (a negative share count is meaningless)
-
-Scope rationale -- why this is one rule, and why it is separate from others:
-- Separate from `OhlcRangeViolation` because that rule checks *relative
-  geometry* within a bar. A bar like open=-5, high=-1, low=-10, close=-3
-  satisfies every geometry invariant while being economically impossible, so
-  the two detect genuinely different pathologies and deserve distinct rule_ids
-  and `details` shapes.
-- Separate from `VolumeAnomaly` because that rule is a *statistical* detector
-  whose findings are inherently ambiguous (a spike may be a real market event),
-  so it carries WARNING. Negative volume is unambiguous and deserves CRITICAL.
-  `ValidationRule.default_severity` is a single class-level attribute -- one
-  severity per rule -- so an unambiguous CRITICAL finding cannot share a rule
-  with an ambiguous WARNING one without mis-reporting one of them. That
-  architectural constraint is what forced this split.
-- Grouping non-positive prices together with negative volume IS appropriate:
-  both are "this value is impossible" checks sharing one severity (CRITICAL)
-  and one remedy (the data is wrong; go back to the source).
-
-Deliberately NOT covered:
-- `volume == 0`, which is legitimate for illiquid names, halted trading, or a
-  session with no trades -- ambiguous, so not an "impossible value".
-
-This is the 14th rule, added beyond the original 13 in the scaffold spec --
-the same "separate rule rather than retrofit a second concern" reasoning
-PROJECT_STATUS.md already floated for a possible `structural.null_timestamps`.
-Implementation should follow `OhlcRangeViolation`'s shape closely: vectorized
-`any_horizontal` over per-column predicates, distinct-row `affected_rows`,
-`details` capped at `max_rows_in_details`, CRITICAL -> FAIL.
+  - any OHLC price <= 0    (a zero or negative price is not a real trade)
+  - any OHLC price is NaN  (definitionally not a number, let alone a price)
+  - volume < 0             (a negative share count is meaningless)
 '''
 @register
 class ImpossibleValues(ValidationRule):
@@ -175,8 +148,114 @@ class ImpossibleValues(ValidationRule):
     category = Category.NUMERICAL
     default_severity = Severity.CRITICAL
 
+    # Label used when a row matches the vendor no-trade encoding.
+    NO_TRADE_LABEL = "no-trade bar (all prices zero)"
+
     def validate(self, dataset: CanonicalDataset, context: RuleContext) -> ValidationResult:
-        raise NotImplementedError("TODO: implement numerical.impossible_values")
+        df = dataset.df
+
+        present_prices = [c for c in OHLC_COLUMNS if c in df.columns]
+        has_volume = "volume" in df.columns
+
+        # (check name, expression) pairs, built only for columns present.
+        checks: list[tuple[str, pl.Expr]] = []
+        for col in present_prices:
+            checks.append((f"{col} <= 0", pl.col(col) <= 0))
+            # NaN applies to float columns only; volume is Int64 and cannot be NaN.
+            if df.schema[col].is_float():
+                checks.append((f"{col} is NaN", pl.col(col).is_nan()))
+        if has_volume:
+            checks.append(("volume < 0", pl.col("volume") < 0))
+
+        if not checks or df.height == 0:
+            return ValidationResult(
+                rule_id=self.rule_id,
+                rule_name=self.rule_name,
+                category=self.category,
+                severity=self.default_severity,
+                status=Status.PASS,
+                message="No impossible values found.",
+            )
+
+        check_names = [name for name, _ in checks]
+        reported_cols = present_prices + (["volume"] if has_volume else [])
+
+        # The no-trade pattern requires the full OHLC set AND volume, so a
+        # partial-column dataset can't be mislabelled as a no-trade bar. Rows
+        # with all-zero prices but POSITIVE volume are contradictory rather than
+        # a vendor convention, so volume == 0 is part of the pattern.
+        if len(present_prices) == len(OHLC_COLUMNS) and has_volume:
+            no_trade_expr = pl.all_horizontal(
+                [pl.col(c) == 0 for c in present_prices] + [pl.col("volume") == 0]
+            )
+        else:
+            no_trade_expr = pl.lit(False)  # noqa: FBT003
+
+        flagged = df.select(
+            pl.int_range(0, df.height).alias("index"),
+            *[pl.col(c) for c in reported_cols],
+            *[expr.alias(name) for name, expr in checks],
+            no_trade_expr.alias("_no_trade"),
+        )
+
+        violations_df = flagged.filter(pl.any_horizontal([pl.col(n) for n in check_names]))
+        affected_rows = violations_df.height
+
+        if affected_rows == 0:
+            return ValidationResult(
+                rule_id=self.rule_id,
+                rule_name=self.rule_name,
+                category=self.category,
+                severity=self.default_severity,
+                status=Status.PASS,
+                message="No impossible values found.",
+            )
+
+        capped = violations_df.head(context.config.max_rows_in_details)
+        violations = []
+        no_trade_count = 0
+        for row in capped.iter_rows(named=True):
+            if row["_no_trade"]:
+                failed = [self.NO_TRADE_LABEL]
+            else:
+                failed = [n for n in check_names if row[n]]
+            violations.append(
+                {
+                    "index": row["index"],
+                    **{c: row[c] for c in reported_cols},
+                    "failed_checks": failed,
+                }
+            )
+
+        # Counted over the full violation set, not just the capped sample, so the
+        # summary stays accurate when details are truncated.
+        if "_no_trade" in violations_df.columns:
+            no_trade_count = violations_df.select(pl.col("_no_trade").sum()).item()
+
+        first = violations[0]
+        message = (
+            f"{affected_rows} row(s) contain impossible values "
+            f"(first at index {first['index']}: {', '.join(first['failed_checks'])})."
+        )
+        if no_trade_count:
+            message += (
+                f" {no_trade_count} of these are no-trade bars "
+                f"(all prices zero with zero volume)."
+            )
+
+        return ValidationResult(
+            rule_id=self.rule_id,
+            rule_name=self.rule_name,
+            category=self.category,
+            severity=self.default_severity,
+            status=Status.FAIL,
+            message=message,
+            details={
+                "violations": violations,
+                "no_trade_bar_count": no_trade_count,
+            },
+            affected_rows=affected_rows,
+        )
 
 
 '''
