@@ -26,6 +26,6 @@ htmlcov/
 tests/fixtures/*.parquet
 tests/fixtures/*.csv
 
-# Planning docs
-marketcheck-scaffold-spec.md
+# Planning and reference docs
 PROJECT_STATUS.md
+marketcheck-scaffold-spec.md
