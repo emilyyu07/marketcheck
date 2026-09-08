@@ -6,6 +6,7 @@ from marketcheck.models.dataset import CanonicalDataset
 from marketcheck.models.enums import Category, Severity, Status
 from marketcheck.models.result import ValidationResult
 from marketcheck.validators.base import RuleContext, ValidationRule, register
+from marketcheck.validators.signatures import matches_split_ratio_expr
 
 # The four price columns whose internal geometry OhlcRangeViolation validates.
 # `volume` is deliberately excluded -- VolumeAnomaly owns volume.
@@ -376,6 +377,20 @@ class VolumeAnomaly(ValidationRule):
         )
 
 
+'''
+Rule: Suspicious Price Jump
+Flags large close-to-close price moves that have no reasonable explanation, as a
+candidate for human review (not a definitive corrupt data verdict).
+
+Key points:
+- cannot distynguish a data error from a genuine market event (thus 
+false positives are acceptable and expected)
+- only close-to-close moves are examined in v1 (known gap: a single-bar 
+"wick" spike is geometrically valid and does not move close-to-close returns, 
+so nothing currently detects it)
+- dividends and splits are excluded, but only at session boundaries (a 
+split takes effect at the start of a session, never mid-session)
+'''
 @register
 class SuspiciousPriceJump(ValidationRule):
     rule_id = "numerical.suspicious_price_jump"
@@ -384,4 +399,125 @@ class SuspiciousPriceJump(ValidationRule):
     default_severity = Severity.WARNING
 
     def validate(self, dataset: CanonicalDataset, context: RuleContext) -> ValidationResult:
-        raise NotImplementedError("TODO: implement numerical.suspicious_price_jump")
+        df = dataset.df
+
+        # MissingColumns owns absent columns; skip rather than crash.
+        if "close" not in df.columns:
+            return ValidationResult(
+                rule_id=self.rule_id,
+                rule_name=self.rule_name,
+                category=self.category,
+                severity=self.default_severity,
+                status=Status.PASS,
+                message="No close column present; skipped.",
+            )
+
+        # Need at least one consecutive pair to compute a move.
+        if df.height < 2:
+            return ValidationResult(
+                rule_id=self.rule_id,
+                rule_name=self.rule_name,
+                category=self.category,
+                severity=self.default_severity,
+                status=Status.PASS,
+                message="No suspicious price jumps detected.",
+            )
+
+        intraday_threshold = context.config.price_jump_intraday_threshold
+        overnight_threshold = context.config.price_jump_overnight_threshold
+        tolerance = context.config.split_ratio_tolerance
+
+        # Without timestamps we cannot identify session boundaries, so treat
+        # every transition as overnight (looser) rather than inventing intraday
+        # violations.
+        if "timestamp" in df.columns:
+            date_col = pl.col("timestamp").dt.date()
+            is_boundary = date_col != date_col.shift(1)
+        else:
+            is_boundary = pl.lit(True)  # noqa: FBT003
+
+        prev_close = pl.col("close").shift(1)
+        ratio = pl.col("close") / prev_close
+
+        base = df.select(
+            pl.int_range(0, df.height).alias("index"),
+            *([pl.col("timestamp")] if "timestamp" in df.columns else []),
+            prev_close.alias("previous_close"),
+            pl.col("close"),
+            ratio.alias("ratio"),
+            is_boundary.alias("is_session_boundary"),
+        ).with_columns(
+            ((pl.col("ratio") - 1) * 100).alias("pct_change"),
+            pl.when(pl.col("is_session_boundary"))
+            .then(pl.lit(overnight_threshold))
+            .otherwise(pl.lit(intraday_threshold))
+            .alias("threshold"),
+        )
+
+        # A split only occurs between sessions, so the exclusion is gated on the
+        # boundary flag -- intraday split-shaped ratios remain suspicious.
+        looks_like_split = pl.col("is_session_boundary") & matches_split_ratio_expr(
+            pl.col("ratio"), tolerance
+        )
+
+        violations_df = base.filter(
+            # Guard against non-positive/zero prices: the ratio would be
+            # meaningless or infinite. ImpossibleValues owns those rows.
+            (pl.col("previous_close") > 0)
+            & (pl.col("close") > 0)
+            & ((pl.col("ratio") - 1).abs() > pl.col("threshold"))
+            & ~looks_like_split
+        )
+
+        affected_rows = violations_df.height
+
+        if affected_rows == 0:
+            return ValidationResult(
+                rule_id=self.rule_id,
+                rule_name=self.rule_name,
+                category=self.category,
+                severity=self.default_severity,
+                status=Status.PASS,
+                message="No suspicious price jumps detected.",
+            )
+
+        capped = violations_df.head(context.config.max_rows_in_details)
+        violations = [
+            {
+                "index": row["index"],
+                "previous_close": row["previous_close"],
+                "close": row["close"],
+                "pct_change": round(row["pct_change"], 2),
+                "transition": (
+                    "overnight" if row["is_session_boundary"] else "intraday"
+                ),
+                "threshold_pct": round(row["threshold"] * 100, 2),
+            }
+            for row in capped.iter_rows(named=True)
+        ]
+
+        first = violations[0]
+        # Review-oriented wording: a large move may be a genuine market event.
+        message = (
+            f"{affected_rows} price move(s) exceed the configured jump threshold "
+            f"and may warrant review (first at index {first['index']}: "
+            f"{first['previous_close']:g} -> {first['close']:g}, "
+            f"{first['pct_change']:+g}% {first['transition']}, "
+            f"threshold {first['threshold_pct']:g}%)."
+        )
+
+        return ValidationResult(
+            rule_id=self.rule_id,
+            rule_name=self.rule_name,
+            category=self.category,
+            severity=self.default_severity,
+            status=Status.WARN,
+            message=message,
+            details={
+                "violations": violations,
+                "intraday_threshold_pct": round(intraday_threshold * 100, 2),
+                "overnight_threshold_pct": round(overnight_threshold * 100, 2),
+                "split_ratio_tolerance": tolerance,
+            },
+            affected_rows=affected_rows,
+        )
