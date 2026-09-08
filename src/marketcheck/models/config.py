@@ -44,6 +44,32 @@ class ValidationConfig(BaseModel):
     sensible local baseline at either scale.
     """
 
+    price_jump_intraday_threshold: float = 0.20
+    """SuspiciousPriceJump: fractional close-to-close move flagged WITHIN a session.
+
+    Default 0.20 (20%). Exchange circuit breakers halt trading on 5-10% moves over
+    five minutes, so a 20% move between consecutive intraday bars is well outside
+    normal market behaviour.
+    """
+
+    price_jump_overnight_threshold: float = 0.50
+    """SuspiciousPriceJump: fractional close-to-close move flagged ACROSS a session boundary.
+
+    Default 0.50 (50%), deliberately looser than the intraday threshold because
+    overnight gaps are structurally larger (earnings, news). Still tight enough to
+    catch order-of-magnitude errors such as a decimal shift (+900%).
+
+    Note this threshold also governs DAILY data, where every consecutive pair is a
+    session boundary — which is what keeps the rule frequency-agnostic.
+    """
+
+    split_ratio_tolerance: float = 0.02
+    """Relative tolerance when matching a price ratio to a known stock-split ratio.
+
+    Default 0.02 (2%). Tolerance is required because the price also moves on genuine
+    trading across the same interval, so a 2:1 split rarely produces exactly 0.5.
+    """
+
     output_format: str = "text"
     """Default output format: 'text' or 'json'."""
 
