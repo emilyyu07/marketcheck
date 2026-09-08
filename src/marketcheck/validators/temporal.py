@@ -1,4 +1,4 @@
-"""Temporal validation rules (4 rules)."""
+"""Temporal validation rules (4 rules; 3 implemented)."""
 
 import polars as pl
 
@@ -6,6 +6,7 @@ from marketcheck.models.dataset import CanonicalDataset
 from marketcheck.models.enums import Category, Severity, Status
 from marketcheck.models.result import ValidationResult
 from marketcheck.validators.base import RuleContext, ValidationRule, register
+from marketcheck.validators.frequency import format_frequency, infer_frequency
 
 '''
 Rule: Missing Trading Sessions
@@ -100,6 +101,22 @@ class MissingSessions(ValidationRule):
         )
 
 
+'''
+Rule: Gaps Within Session
+Checks whether bars are missing within a trading session (e.g. 1-minute data
+that jumps from 10:15 straight to 10:23)
+
+Key notes:
+- expected spacing is inferred from data itself (most common spacing is the inferred grid size)
+- delta-based, not grid-based: detection compares consecutive bars rather than diffing against a reconstructed timestamp grid from session hours
+- no calendar dependency
+- session boundaries excluded, so overnight gaps are never reported here (MissingSessions owns absent days)
+
+Mechanics: sort a copy -> drop duplicate timestamps -> take consecutive deltas ->
+discard deltas that span a session boundary -> infer the modal spacing -> any
+surviving delta larger than one bar is a gap, hiding `delta/frequency - 1` bars.
+
+'''
 @register
 class GapsWithinSession(ValidationRule):
     rule_id = "temporal.gaps_within_session"
@@ -108,7 +125,146 @@ class GapsWithinSession(ValidationRule):
     default_severity = Severity.WARNING
 
     def validate(self, dataset: CanonicalDataset, context: RuleContext) -> ValidationResult:
-        raise NotImplementedError("TODO: implement temporal.gaps_within_session")
+        df = dataset.df
+
+        def _pass(message: str, details: dict | None = None) -> ValidationResult:
+            return ValidationResult(
+                rule_id=self.rule_id,
+                rule_name=self.rule_name,
+                category=self.category,
+                severity=self.default_severity,
+                status=Status.PASS,
+                message=message,
+                details=details or {},
+            )
+
+        # MissingColumns owns absent columns; skip rather than crash.
+        if "timestamp" not in df.columns:
+            return _pass("No timestamp column present; skipped.")
+
+        # Need at least two rows to form a single delta.
+        if df.height < 2:
+            return _pass("No gaps within sessions detected.")
+
+        min_missing = context.config.gap_min_missing_bars
+        dominance = context.config.gap_frequency_dominance
+
+        # Work on a sorted, de-duplicated COPY. Rules run independently and cannot
+        # assume sorted input -- the same reasoning that drove DuplicateTimestamps
+        # to group-by rather than shift. Duplicates are dropped because a zero
+        # delta is not a gap and would corrupt the modal spacing;
+        # UnsortedTimestamps and DuplicateTimestamps own those defects.
+        ordered = (
+            df.select("timestamp")
+            .drop_nulls()
+            .unique(subset="timestamp")
+            .sort("timestamp")
+        )
+        if ordered.height < 2:
+            return _pass("No gaps within sessions detected.")
+
+        # A session boundary is a change of calendar date. Deltas that span one
+        # are excluded from BOTH inference and detection: an overnight gap is not
+        # a within-session gap, and MissingSessions owns absent days.
+        #
+        # This is also what makes the rule frequency-agnostic without configuration:
+        # for DAILY data every delta spans a boundary, so no within-session deltas
+        # remain, inference fails, and the rule skips -- which is correct, because
+        # "gap within a session" is meaningless when each session holds one bar.
+        date_col = pl.col("timestamp").dt.date()
+        analysed = ordered.with_columns(
+            pl.int_range(0, ordered.height).alias("index"),
+            pl.col("timestamp").diff().alias("delta"),
+            (date_col != date_col.shift(1)).alias("is_session_boundary"),
+        ).filter(~pl.col("is_session_boundary").fill_null(True))
+
+        if analysed.height == 0:
+            return _pass(
+                "No intra-session intervals to analyse (one bar per session); skipped."
+            )
+
+        frequency, confidence = infer_frequency(analysed.get_column("delta"), dominance)
+        if frequency is None:
+            # Not a regular grid (tick/event data, or an ambiguous tie). Reporting
+            # gaps here would mean flagging almost every interval, so the rule
+            # declines to guess and says why.
+            return _pass(
+                "Could not infer a consistent bar frequency "
+                f"(most common spacing accounts for {confidence:.0%} of intervals, "
+                f"below the {dominance:.0%} required); skipped.",
+                {"frequency_confidence": round(confidence, 4)},
+            )
+
+        # A gap exists where the observed delta exceeds one bar. missing_bars
+        # subtracts 1 because the delta spans from the last surviving bar TO the
+        # next surviving bar: a 4-minute delta on a 1-minute grid hides 3 bars,
+        # not 4.
+        freq_us = int(frequency.total_seconds() * 1_000_000)
+        gaps = analysed.with_columns(
+            ((pl.col("delta").dt.total_microseconds() // freq_us) - 1).alias("missing_bars")
+        ).filter(pl.col("missing_bars") >= min_missing)
+
+        gap_count = gaps.height
+        frequency_label = format_frequency(frequency)
+        summary = {
+            "inferred_frequency": frequency_label,
+            "frequency_confidence": round(confidence, 4),
+        }
+
+        if gap_count == 0:
+            return _pass(
+                f"No gaps within sessions detected ({frequency_label} bars).", summary
+            )
+
+        # Totals are computed over the FULL gap set, before details are capped, so
+        # the summary stays accurate on heavily-holed data.
+        missing_series = gaps.get_column("missing_bars")
+        total_missing = int(missing_series.sum())
+        largest_gap = int(missing_series.max())
+
+        capped = gaps.head(context.config.max_rows_in_details)
+        violations = [
+            {
+                # Position in SORTED order, since detection runs on a sorted copy.
+                # Timestamps are the primary locator here for that reason.
+                "index": row["index"],
+                "gap_start": row["timestamp"] - row["delta"],
+                "gap_end": row["timestamp"],
+                "gap_duration": format_frequency(row["delta"]),
+                "missing_bars": int(row["missing_bars"]),
+            }
+            for row in capped.iter_rows(named=True)
+        ]
+
+        first = violations[0]
+        # Worded for review, not corruption: a genuine trading halt produces a
+        # legitimate gap and this rule cannot distinguish one from a truncated
+        # feed. Same ambiguity that keeps VolumeAnomaly at WARNING.
+        message = (
+            f"{gap_count} gap(s) within sessions, {total_missing} missing "
+            f"{frequency_label} bar(s) in total "
+            f"(largest {largest_gap}; first after {first['gap_start']}, "
+            f"{first['missing_bars']} bar(s) absent)."
+        )
+
+        return ValidationResult(
+            rule_id=self.rule_id,
+            rule_name=self.rule_name,
+            category=self.category,
+            severity=self.default_severity,
+            status=Status.WARN,
+            message=message,
+            details={
+                "violations": violations,
+                "gap_count": gap_count,
+                "total_missing_bars": total_missing,
+                "largest_gap_bars": largest_gap,
+                **summary,
+            },
+            # Distinct EXISTING rows that follow a gap. Missing bars are not rows,
+            # so counting them would break the convention and could exceed row_count.
+            affected_rows=gap_count,
+        )
 
 
 '''
@@ -157,7 +313,7 @@ class OutsideTradingHours(ValidationRule):
         # outside the half-open [regular_open, regular_close) interval. Null
         # timestamps produce a null time_of_day, and comparisons against
         # null evaluate to null (not True) in the filter, so they're
-        # excluded automatically -- NullValues owns reporting them.
+        # excluded automatically (NullValues check owns reporting them).
         violations_df = (
             df.select(
                 pl.int_range(0, df.height).alias("index"),
