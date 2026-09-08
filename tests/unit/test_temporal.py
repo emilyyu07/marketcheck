@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import polars as pl
 import pytest
@@ -12,6 +12,7 @@ from marketcheck.models.dataset import CanonicalDataset
 from marketcheck.models.enums import Category, Severity, Status
 from marketcheck.validators import REGISTRY
 from marketcheck.validators.base import RuleContext
+from marketcheck.validators.frequency import format_frequency, infer_frequency
 from marketcheck.validators.temporal import (
     GapsWithinSession,
     MissingSessions,
@@ -29,7 +30,6 @@ ALL_TEMPORAL_RULES = [
 
 # Rules that are still stubs — used to assert NotImplementedError is raised.
 STUB_TEMPORAL_RULES = [
-    GapsWithinSession,
     TimezoneInconsistency,
 ]
 
@@ -224,6 +224,20 @@ class TestOutsideTradingHours:
         assert violation["index"] == 0
         assert violation["timestamp"] == ts_value
         assert violation["time_of_day"] == ts_value.time()
+
+    def test_pass_documents_limit_when_gaps_outnumber_real_intervals(self) -> None:
+        """HONEST LIMITATION of mode-based inference. In 09:30, 09:31, 09:32, then
+        every second minute, the 2-minute *gap* spacing occurs more often than the
+        true 1-minute spacing — so the mode concludes the grid is 2min and reports
+        nothing. Mode inference assumes gaps are the minority; when they are not,
+        the rule under-reports rather than guessing.
+        """
+        result = GapsWithinSession().validate(
+            _make_dataset(_bars([0, 1, 2, 4, 6, 8, 10, 12])), _make_context()
+        )
+
+        assert result.status == Status.PASS
+        assert result.details["inferred_frequency"] == "2min"
 
     # --- Message format checks ------------------------------------------------
 
@@ -444,3 +458,434 @@ class TestMissingSessions:
 
         assert result.message
         assert "session" in result.message.lower()
+
+
+# ---------------------------------------------------------------------------
+# GapsWithinSession
+# ---------------------------------------------------------------------------
+
+def _bars(
+    minute_offsets: list[int],
+    day: int = 2,
+    start_hour: int = 9,
+    start_minute: int = 30,
+) -> pl.DataFrame:
+    """Timestamps at the given minute offsets from 09:30 on 2024-01-{day}."""
+    base = datetime(2024, 1, day, start_hour, start_minute)
+    return pl.DataFrame(
+        {"timestamp": [base + timedelta(minutes=m) for m in minute_offsets]},
+        schema={"timestamp": pl.Datetime("us")},
+    )
+
+
+def _multi_day_bars(days: list[int], minute_offsets: list[int]) -> pl.DataFrame:
+    """The same intraday offsets repeated across several sessions."""
+    rows: list[datetime] = []
+    for day in days:
+        base = datetime(2024, 1, day, 9, 30)
+        rows.extend(base + timedelta(minutes=m) for m in minute_offsets)
+    return pl.DataFrame({"timestamp": rows}, schema={"timestamp": pl.Datetime("us")})
+
+
+class TestGapsWithinSession:
+    """Tests for the GapsWithinSession validation rule."""
+
+    # --- PASS cases ---------------------------------------------------------
+
+    def test_pass_contiguous_minute_bars(self) -> None:
+        """A complete 1-minute run has no gaps."""
+        result = GapsWithinSession().validate(
+            _make_dataset(_bars(list(range(10)))), _make_context()
+        )
+
+        assert result.status == Status.PASS
+        assert result.rule_id == "temporal.gaps_within_session"
+        assert result.affected_rows == 0
+
+    def test_pass_reports_inferred_frequency_on_clean_data(self) -> None:
+        """Even on PASS the inferred grid is disclosed, so the reader can confirm
+        the rule interpreted the data the way they expect."""
+        result = GapsWithinSession().validate(
+            _make_dataset(_bars(list(range(10)))), _make_context()
+        )
+
+        assert result.details["inferred_frequency"] == "1min"
+        assert result.details["frequency_confidence"] == 1.0
+
+    def test_pass_five_minute_grid(self) -> None:
+        """The grid is inferred, not assumed to be 1-minute."""
+        result = GapsWithinSession().validate(
+            _make_dataset(_bars([0, 5, 10, 15, 20])), _make_context()
+        )
+
+        assert result.status == Status.PASS
+        assert result.details["inferred_frequency"] == "5min"
+
+    def test_pass_timestamp_column_missing(self) -> None:
+        """MissingColumns owns absent columns."""
+        df = pl.DataFrame({"close": [1.0, 2.0]}, schema={"close": pl.Float64})
+        result = GapsWithinSession().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+
+    def test_pass_single_row(self) -> None:
+        """One row cannot form a delta."""
+        result = GapsWithinSession().validate(_make_dataset(_bars([0])), _make_context())
+
+        assert result.status == Status.PASS
+
+    def test_pass_empty_dataset(self) -> None:
+        result = GapsWithinSession().validate(_make_dataset(_bars([])), _make_context())
+
+        assert result.status == Status.PASS
+
+    def test_pass_standard_fixture(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """The shared fixture is 10 contiguous minute bars."""
+        result = GapsWithinSession().validate(
+            _make_dataset(sample_ohlcv_df), _make_context()
+        )
+
+        assert result.status == Status.PASS
+
+    def test_pass_daily_data_self_skips(self) -> None:
+        """KEY PROPERTY: for daily data every delta spans a session boundary, so
+        no within-session interval exists to analyse. The rule skips with no
+        special-casing — correct, because 'gap within a session' is meaningless
+        when each session holds a single bar."""
+        result = GapsWithinSession().validate(
+            _make_dataset(_df_for_dates(["2024-01-02", "2024-01-03", "2024-01-04"])),
+            _make_context(),
+        )
+
+        assert result.status == Status.PASS
+        assert "one bar per session" in result.message
+
+    def test_pass_overnight_gap_not_reported(self) -> None:
+        """The long gap between one session's close and the next session's open is
+        not a within-session gap; MissingSessions owns absent days."""
+        result = GapsWithinSession().validate(
+            _make_dataset(_multi_day_bars([2, 3], [0, 1, 2, 3])), _make_context()
+        )
+
+        assert result.status == Status.PASS
+
+    def test_pass_irregular_data_skipped(self) -> None:
+        """THE DOMINANCE GUARD. Tick-like data has no fixed grid, so the modal
+        delta is arbitrary and nearly every interval would look like a gap. The
+        rule must decline rather than emit a flood of false positives."""
+        result = GapsWithinSession().validate(
+            _make_dataset(_bars([0, 1, 3, 6, 10, 15, 21])), _make_context()
+        )
+
+        assert result.status == Status.PASS
+        assert "could not infer" in result.message.lower()
+
+    def test_pass_ambiguous_tie_skipped(self) -> None:
+        """A perfect two-way tie (each spacing exactly half the intervals) is
+        ambiguous. The dominance comparison is strict precisely so this is
+        rejected rather than resolved arbitrarily by the tie-break."""
+        # deltas: 1, 1, 5, 5
+        result = GapsWithinSession().validate(
+            _make_dataset(_bars([0, 1, 2, 7, 12])), _make_context()
+        )
+
+        assert result.status == Status.PASS
+        assert "could not infer" in result.message.lower()
+
+    def test_pass_confidence_reported_when_inference_rejected(self) -> None:
+        """The confidence is disclosed even on failure, so the skip is auditable."""
+        result = GapsWithinSession().validate(
+            _make_dataset(_bars([0, 1, 3, 6, 10, 15, 21])), _make_context()
+        )
+
+        assert "frequency_confidence" in result.details
+
+    def test_pass_null_timestamps_ignored(self) -> None:
+        """NullValues owns nulls; they cannot participate in a delta."""
+        df = pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime(2024, 1, 2, 9, 30),
+                    None,
+                    datetime(2024, 1, 2, 9, 31),
+                    datetime(2024, 1, 2, 9, 32),
+                ]
+            },
+            schema={"timestamp": pl.Datetime("us")},
+        )
+        result = GapsWithinSession().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+
+    def test_pass_duplicate_timestamps_do_not_create_gaps(self) -> None:
+        """A zero delta is not a gap, and duplicates must not corrupt the modal
+        spacing. DuplicateTimestamps owns that defect."""
+        result = GapsWithinSession().validate(
+            _make_dataset(_bars([0, 1, 1, 2, 3])), _make_context()
+        )
+
+        assert result.status == Status.PASS
+        assert result.details["inferred_frequency"] == "1min"
+
+    def test_pass_gap_below_configured_minimum(self) -> None:
+        """Raising gap_min_missing_bars suppresses small holes."""
+        df = _bars([0, 1, 2, 4, 5, 6])  # one missing bar at 09:33
+        context = RuleContext(config=ValidationConfig(gap_min_missing_bars=2))
+        result = GapsWithinSession().validate(_make_dataset(df), context)
+
+        assert result.status == Status.PASS
+
+    # --- WARN cases ---------------------------------------------------------
+
+    def test_warn_single_gap_worked_example(self) -> None:
+        """09:30-09:33 then 09:37: a 4-minute delta hiding 3 bars."""
+        result = GapsWithinSession().validate(
+            _make_dataset(_bars([0, 1, 2, 3, 7, 8])), _make_context()
+        )
+
+        assert result.status == Status.WARN
+        assert result.severity == Severity.WARNING
+        assert result.affected_rows == 1
+        v = result.details["violations"][0]
+        assert v["gap_start"] == datetime(2024, 1, 2, 9, 33)
+        assert v["gap_end"] == datetime(2024, 1, 2, 9, 37)
+        assert v["missing_bars"] == 3
+        assert v["gap_duration"] == "4min"
+
+    def test_warn_missing_bars_arithmetic_is_not_off_by_one(self) -> None:
+        """REGRESSION GUARD. A 4-minute delta on a 1-minute grid hides 3 bars, not
+        4, because gap_end itself is present. Reporting 4 would look plausible and
+        be wrong."""
+        result = GapsWithinSession().validate(
+            _make_dataset(_bars([0, 4])), _make_context()
+        )
+        # Only one delta, so the grid cannot be inferred from this alone.
+        assert result.status == Status.PASS
+
+        # With a credible grid, the arithmetic must hold.
+        result = GapsWithinSession().validate(
+            _make_dataset(_bars([0, 1, 2, 6])), _make_context()
+        )
+        assert result.details["violations"][0]["missing_bars"] == 3
+
+    def test_warn_single_missing_bar_reported_by_default(self) -> None:
+        """Default gap_min_missing_bars=1 reports even one-bar holes: a backtest
+        assuming every bar exists is affected by them."""
+        result = GapsWithinSession().validate(
+            _make_dataset(_bars([0, 1, 2, 4, 5, 6])), _make_context()
+        )
+
+        assert result.status == Status.WARN
+        assert result.details["violations"][0]["missing_bars"] == 1
+
+    def test_warn_multiple_gaps_counted_and_summarised(self) -> None:
+        """Two holes: 1 bar missing, then 4 bars missing."""
+        result = GapsWithinSession().validate(
+            _make_dataset(_bars([0, 1, 2, 4, 5, 10, 11, 12])), _make_context()
+        )
+
+        assert result.status == Status.WARN
+        assert result.details["gap_count"] == 2
+        assert result.details["total_missing_bars"] == 5
+        assert result.details["largest_gap_bars"] == 4
+        assert result.affected_rows == 2
+
+    def test_warn_largest_gap_distinguishes_scatter_from_outage(self) -> None:
+        """largest_gap_bars is the key diagnostic: identical total loss means very
+        different things depending on whether it is scattered or contiguous."""
+        # 1-minute spacing must stay the clear majority, otherwise the gap
+        # spacing itself becomes the inferred grid (see the limit test below).
+        scattered = GapsWithinSession().validate(
+            _make_dataset(_bars([0, 1, 2, 3, 4, 6, 7, 8, 9, 11])), _make_context()
+        )
+        contiguous = GapsWithinSession().validate(
+            _make_dataset(_bars([0, 1, 2, 3, 4, 5, 6, 12])), _make_context()
+        )
+
+        assert scattered.details["largest_gap_bars"] == 1
+        assert contiguous.details["largest_gap_bars"] == 5
+        assert scattered.details["gap_count"] > contiguous.details["gap_count"]
+
+    def test_warn_gap_detected_in_second_session(self) -> None:
+        """Gaps are found per session, not only in the first one."""
+        rows = [datetime(2024, 1, 2, 9, 30) + timedelta(minutes=m) for m in range(4)]
+        rows += [datetime(2024, 1, 3, 9, 30) + timedelta(minutes=m) for m in [0, 1, 5, 6]]
+        df = pl.DataFrame({"timestamp": rows}, schema={"timestamp": pl.Datetime("us")})
+        result = GapsWithinSession().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.WARN
+        assert result.details["violations"][0]["gap_start"] == datetime(2024, 1, 3, 9, 31)
+
+    def test_warn_unsorted_input_still_detected(self) -> None:
+        """Rules run independently and cannot assume sorted input, so detection
+        runs on a sorted copy. UnsortedTimestamps owns row order."""
+        ordered = _bars([0, 1, 2, 3, 7, 8])
+        shuffled = ordered.sort("timestamp", descending=True)
+        result = GapsWithinSession().validate(_make_dataset(shuffled), _make_context())
+
+        assert result.status == Status.WARN
+        assert result.details["violations"][0]["missing_bars"] == 3
+
+    def test_warn_five_minute_grid_gap(self) -> None:
+        """Gap arithmetic scales with the inferred grid, not a hardcoded minute."""
+        result = GapsWithinSession().validate(
+            _make_dataset(_bars([0, 5, 10, 30, 35])), _make_context()
+        )
+
+        assert result.status == Status.WARN
+        assert result.details["inferred_frequency"] == "5min"
+        assert result.details["violations"][0]["missing_bars"] == 3
+
+    def test_warn_details_capped_but_totals_complete(self) -> None:
+        """Totals are computed over the full gap set before details are capped."""
+        # Six runs of five contiguous bars, each separated by a 3-minute step that
+        # hides 2 bars: 24 one-minute deltas vs 5 gap deltas, so 1min stays modal.
+        offsets: list[int] = []
+        cursor = 0
+        for _ in range(6):
+            for _ in range(5):
+                offsets.append(cursor)
+                cursor += 1
+            cursor += 2
+        context = RuleContext(config=ValidationConfig(max_rows_in_details=2))
+        result = GapsWithinSession().validate(_make_dataset(_bars(offsets)), context)
+
+        assert len(result.details["violations"]) == 2
+        assert result.details["gap_count"] > 2
+        assert result.affected_rows == result.details["gap_count"]
+
+    def test_warn_affected_rows_never_exceeds_row_count(self) -> None:
+        """affected_rows counts EXISTING rows following a gap, not missing bars —
+        which would otherwise exceed the dataset size on heavily-holed data."""
+        df = _bars([0, 1, 2, 500])
+        result = GapsWithinSession().validate(_make_dataset(df), _make_context())
+
+        assert result.details["total_missing_bars"] > df.height
+        assert result.affected_rows <= df.height
+
+    # --- Message format checks -----------------------------------------------
+
+    def test_warn_message_is_worded_as_review_not_corruption(self) -> None:
+        """A genuine trading halt produces a legitimate gap and this rule cannot
+        distinguish one from a truncated feed, so it must not claim corruption."""
+        result = GapsWithinSession().validate(
+            _make_dataset(_bars([0, 1, 2, 3, 7, 8])), _make_context()
+        )
+
+        lowered = result.message.lower()
+        for overclaim in ("corrupt", "invalid"):
+            assert overclaim not in lowered
+
+    def test_warn_message_includes_counts_and_frequency(self) -> None:
+        result = GapsWithinSession().validate(
+            _make_dataset(_bars([0, 1, 2, 4, 5, 10, 11])), _make_context()
+        )
+
+        assert "2 gap(s)" in result.message
+        assert "1min" in result.message
+
+    def test_pass_message_is_informative(self) -> None:
+        result = GapsWithinSession().validate(
+            _make_dataset(_bars(list(range(5)))), _make_context()
+        )
+
+        assert "no gaps" in result.message.lower()
+
+
+# ---------------------------------------------------------------------------
+# Frequency inference helper (validators/frequency.py)
+# ---------------------------------------------------------------------------
+
+class TestInferFrequency:
+    """Tests for the shared bar-frequency inference helper."""
+
+    @staticmethod
+    def _deltas(minutes: list[float]) -> pl.Series:
+        return pl.Series("delta", [timedelta(minutes=m) for m in minutes])
+
+    def test_mode_wins_over_mean_and_median(self) -> None:
+        """The mode is used because gaps skew the mean and can defeat the median."""
+        freq, confidence = infer_frequency(self._deltas([1, 1, 1, 1, 60]), 0.5)
+
+        assert freq == timedelta(minutes=1)
+        assert confidence == 0.8
+
+    def test_empty_deltas_uninferable(self) -> None:
+        """The daily-data path: no within-session intervals exist."""
+        freq, confidence = infer_frequency(
+            pl.Series("delta", [], dtype=pl.Duration("us")), 0.5
+        )
+
+        assert freq is None
+        assert confidence == 0.0
+
+    def test_irregular_deltas_rejected(self) -> None:
+        freq, _ = infer_frequency(self._deltas([1, 2, 3, 4, 5]), 0.5)
+
+        assert freq is None
+
+    def test_perfect_tie_rejected_as_ambiguous(self) -> None:
+        """Strict majority: at a 50/50 tie neither candidate is credible."""
+        freq, confidence = infer_frequency(self._deltas([1, 1, 5, 5]), 0.5)
+
+        assert freq is None
+        assert confidence == 0.5
+
+    def test_tie_break_is_deterministic(self) -> None:
+        """polars' Series.mode() may return several values in non-deterministic
+        order, which would make the rule answer differently on identical input.
+        The helper sorts explicitly, so repeated calls must agree."""
+        deltas = self._deltas([1, 1, 5, 5, 1])
+        results = {infer_frequency(deltas, 0.5)[0] for _ in range(20)}
+
+        assert len(results) == 1
+
+    def test_dominance_is_configurable(self) -> None:
+        deltas = self._deltas([1, 1, 1, 9, 9])  # 1min at 60%
+
+        assert infer_frequency(deltas, 0.5)[0] == timedelta(minutes=1)
+        assert infer_frequency(deltas, 0.9)[0] is None
+
+    def test_nulls_ignored(self) -> None:
+        deltas = pl.Series("delta", [timedelta(minutes=1), None, timedelta(minutes=1)])
+        freq, confidence = infer_frequency(deltas, 0.5)
+
+        assert freq == timedelta(minutes=1)
+        assert confidence == 1.0
+
+    def test_non_positive_modal_delta_rejected(self) -> None:
+        """Zero deltas would mean division by zero downstream."""
+        freq, _ = infer_frequency(self._deltas([0, 0, 0, 1]), 0.5)
+
+        assert freq is None
+
+
+class TestFormatFrequency:
+    """Tests for the human-readable duration formatter."""
+
+    @pytest.mark.parametrize(
+        ("seconds", "expected"),
+        [
+            (60, "1min"),
+            (300, "5min"),
+            (900, "15min"),
+            (3600, "1h"),
+            (14400, "4h"),
+            (86400, "1d"),
+            (30, "30s"),
+            (90, "1min30s"),
+        ],
+    )
+    def test_formats_common_spacings(self, seconds: int, expected: str) -> None:
+        assert format_frequency(timedelta(seconds=seconds)) == expected
+
+    def test_zero_duration(self) -> None:
+        assert format_frequency(timedelta(0)) == "0s"
+
+    def test_output_is_json_safe_string(self) -> None:
+        """Durations are pre-formatted because a raw timedelta serialises to
+        ISO-8601 ('PT4M') in JSON output, which is valid but unreadable."""
+        import json
+
+        value = format_frequency(timedelta(minutes=4))
+        assert json.dumps({"d": value}) == '{"d": "4min"}'

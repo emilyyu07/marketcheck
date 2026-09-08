@@ -731,7 +731,7 @@ class TestImpossibleValues:
         failed = result.details["violations"][0]["failed_checks"]
         assert set(failed) == {"open <= 0", "high <= 0", "low <= 0", "close <= 0"}
 
-    # --- FAIL cases: NaN ------------------------------------------------------
+    # --- FAIL cases: NaN (not a number) ---------------------------------------
 
     def test_fail_nan_price_detected(self) -> None:
         """NaN is flagged. This is the hole that spanned the whole ruleset:
