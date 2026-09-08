@@ -7,8 +7,8 @@ including required columns, data types, and timestamp ordering.
 Rule 1: MissingColumns
 Rule 2: InvalidDTypes
 Rule 3: UnsortedTimestamps
-Rule 4: DuplicateTimestamps
-Rule 5: NullValues
+Rule 4: NullValues
+Rule 5: DuplicateTimestamps
 """
 
 import polars as pl
@@ -199,7 +199,7 @@ class UnsortedTimestamps(ValidationRule):
         )
 
 '''
-Rule 5: Null / Missing Values 
+Rule 4: Null / Missing Values 
 Checks if any required columns contain null or missing values.
 If any required columns contain null values, the rule fails.
 Produces WARNING severity regardless of which column(s) have nulls.
@@ -272,7 +272,7 @@ class NullValues(ValidationRule):
 
 
 '''
-Rule 4: Duplicate Timestamps
+Rule 5: Duplicate Timestamps
 Checks whether any timestamp value appears on more than one row, anywhere in
 the dataset.
 Produces CRITICAL severity regardless of which row(s) are affected or how many
