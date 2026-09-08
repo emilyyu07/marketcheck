@@ -29,10 +29,25 @@ ALL_TEMPORAL_RULES = [
 
 # Rules that are still stubs — used to assert NotImplementedError is raised.
 STUB_TEMPORAL_RULES = [
-    MissingSessions,
     GapsWithinSession,
     TimezoneInconsistency,
 ]
+
+
+def _df_for_dates(date_strs: list[str], hour: int = 10, minute: int = 0) -> pl.DataFrame:
+    """Build a timestamp-only DataFrame with one row per given date (YYYY-MM-DD).
+
+    Times default to 10:00 (inside regular hours) so this fixture never
+    incidentally trips OutsideTradingHours.
+    """
+    return pl.DataFrame(
+        {
+            "timestamp": [
+                datetime(*(int(p) for p in d.split("-")), hour, minute)  # type: ignore[misc]
+                for d in date_strs
+            ]
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -227,3 +242,205 @@ class TestOutsideTradingHours:
 
         assert result.message
         assert "trading hours" in result.message.lower()
+
+
+# ---------------------------------------------------------------------------
+# MissingSessions — full test suite
+#
+# Test dates are chosen against the REAL NYSE calendar, verified via
+# MarketCalendar.valid_sessions():
+#   - 2024-01-06/07 is a weekend (Sat/Sun)
+#   - 2024-01-15 is MLK Day (holiday); 2024-01-12, 16, 17 are sessions
+#   - 2024-11-28 is Thanksgiving (holiday); 2024-11-29 is a HALF session
+#     (closes 13:00 ET)
+# ---------------------------------------------------------------------------
+
+class TestMissingSessions:
+    """Tests for the MissingSessions validation rule."""
+
+    # --- PASS cases ---------------------------------------------------------
+
+    def test_pass_contiguous_sessions(self) -> None:
+        """Four consecutive trading days, all present -> PASS."""
+        df = _df_for_dates(["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"])
+        result = MissingSessions().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+        assert result.rule_id == "temporal.missing_sessions"
+        assert result.severity == Severity.WARNING
+        assert result.affected_rows == 0
+        assert result.details == {}
+
+    def test_pass_weekend_gap_not_flagged(self) -> None:
+        """Fri 2024-01-05 -> Mon 2024-01-08 skips a weekend, which is not a
+        missing session because the exchange was closed."""
+        df = _df_for_dates(["2024-01-05", "2024-01-08"])
+        result = MissingSessions().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+
+    def test_pass_holiday_gap_not_flagged(self) -> None:
+        """2024-01-15 is MLK Day. Spanning it must not produce a violation."""
+        df = _df_for_dates(["2024-01-12", "2024-01-16"])
+        result = MissingSessions().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+
+    def test_pass_half_session_counts_as_present(self) -> None:
+        """2024-11-29 is a half session (closes 13:00 ET). Having any rows on it
+        counts as present -- this rule judges date presence only, never coverage
+        completeness within a session (that's GapsWithinSession's job).
+        2024-11-28 (Thanksgiving) must also not be flagged."""
+        df = _df_for_dates(["2024-11-27", "2024-11-29"])
+        result = MissingSessions().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+
+    def test_pass_single_date(self) -> None:
+        """A single-day dataset spans a single-session range -> nothing missing."""
+        df = _df_for_dates(["2024-01-02"])
+        result = MissingSessions().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+
+    def test_pass_timestamp_column_missing(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """No timestamp column -> PASS (skip); MissingColumns owns this."""
+        df = sample_ohlcv_df.drop("timestamp")
+        result = MissingSessions().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+
+    def test_pass_empty_dataset(self) -> None:
+        """Zero rows -> no derivable range -> PASS."""
+        df = pl.DataFrame({"timestamp": []}, schema={"timestamp": pl.Datetime("us")})
+        result = MissingSessions().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+
+    def test_pass_all_null_timestamps(self) -> None:
+        """All-null timestamps yield no usable dates -> PASS, not a crash.
+        NullValues owns reporting the nulls themselves."""
+        df = pl.DataFrame(
+            {"timestamp": [None, None]}, schema={"timestamp": pl.Datetime("us")}
+        )
+        result = MissingSessions().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+
+    def test_pass_intraday_rows_same_date_not_duplicated(self) -> None:
+        """Many rows on one date collapse to a single present session."""
+        df = pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime(2024, 1, 2, 9, 30),
+                    datetime(2024, 1, 2, 12, 0),
+                    datetime(2024, 1, 2, 15, 59),
+                ]
+            }
+        )
+        result = MissingSessions().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+
+    # --- WARN cases ----------------------------------------------------------
+
+    def test_warn_single_missing_session(self) -> None:
+        """Omitting 2024-01-04 from an otherwise contiguous run -> 1 missing."""
+        df = _df_for_dates(["2024-01-02", "2024-01-03", "2024-01-05"])
+        result = MissingSessions().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.WARN
+        assert result.severity == Severity.WARNING
+        assert result.details["missing_sessions"] == ["2024-01-04"]
+        assert result.details["missing_count"] == 1
+
+    def test_warn_multiple_missing_sessions(self) -> None:
+        """Omitting two mid-range sessions -> both reported, chronologically."""
+        df = _df_for_dates(["2024-01-02", "2024-01-05", "2024-01-09"])
+        result = MissingSessions().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.WARN
+        # Expected sessions Jan 2-9: 2,3,4,5,8,9. Present: 2,5,9 -> missing 3,4,8.
+        assert result.details["missing_sessions"] == ["2024-01-03", "2024-01-04", "2024-01-08"]
+        assert result.details["missing_count"] == 3
+
+    def test_warn_missing_session_adjacent_to_holiday(self) -> None:
+        """A genuinely missing session next to a holiday is still caught: the
+        holiday (MLK 01-15) is excluded from expectations, but 01-16 is not."""
+        df = _df_for_dates(["2024-01-12", "2024-01-17"])
+        result = MissingSessions().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.WARN
+        assert result.details["missing_sessions"] == ["2024-01-16"]
+
+    def test_warn_affected_rows_is_zero(self) -> None:
+        """affected_rows stays 0 even when sessions are missing: absent sessions
+        contribute no rows to point at. Same convention as MissingColumns."""
+        df = _df_for_dates(["2024-01-02", "2024-01-05"])
+        result = MissingSessions().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.WARN
+        assert result.details["missing_count"] > 0
+        assert result.affected_rows == 0
+
+    def test_warn_details_reports_counts_and_range(self) -> None:
+        """details carries expected/present counts and the derived range."""
+        df = _df_for_dates(["2024-01-02", "2024-01-03", "2024-01-05"])
+        result = MissingSessions().validate(_make_dataset(df), _make_context())
+
+        d = result.details
+        assert d["expected_session_count"] == 4      # Jan 2,3,4,5
+        assert d["present_session_count"] == 3       # Jan 2,3,5
+        assert d["range_start"] == "2024-01-02"
+        assert d["range_end"] == "2024-01-05"
+
+    def test_warn_details_capped_at_max_rows_in_details(self) -> None:
+        """missing_sessions list is capped, but missing_count is the full total."""
+        # Present only the first and last session of a ~2-week span.
+        df = _df_for_dates(["2024-01-02", "2024-01-12"])
+        context = RuleContext(config=ValidationConfig(max_rows_in_details=2))
+        result = MissingSessions().validate(_make_dataset(df), context)
+
+        assert result.status == Status.WARN
+        assert result.details["missing_count"] == 7   # Jan 3,4,5,8,9,10,11
+        assert len(result.details["missing_sessions"]) == 2
+
+    def test_warn_nulls_do_not_collapse_range(self) -> None:
+        """A null timestamp mixed in must not distort the derived date range or
+        masquerade as a covered session."""
+        df = pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime(2024, 1, 2, 10, 0),
+                    None,
+                    datetime(2024, 1, 5, 10, 0),
+                ]
+            },
+            schema={"timestamp": pl.Datetime("us")},
+        )
+        result = MissingSessions().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.WARN
+        assert result.details["range_start"] == "2024-01-02"
+        assert result.details["range_end"] == "2024-01-05"
+        assert result.details["missing_sessions"] == ["2024-01-03", "2024-01-04"]
+
+    # --- Message format checks ------------------------------------------------
+
+    def test_warn_message_contains_count_and_range(self) -> None:
+        """Message must contain the missing count, the range, and a first example."""
+        df = _df_for_dates(["2024-01-02", "2024-01-03", "2024-01-05"])
+        result = MissingSessions().validate(_make_dataset(df), _make_context())
+
+        assert "1" in result.message
+        assert "2024-01-02" in result.message
+        assert "2024-01-05" in result.message
+        assert "2024-01-04" in result.message
+
+    def test_pass_message_is_informative(self) -> None:
+        """Pass message must be non-empty and describe the outcome."""
+        df = _df_for_dates(["2024-01-02", "2024-01-03"])
+        result = MissingSessions().validate(_make_dataset(df), _make_context())
+
+        assert result.message
+        assert "session" in result.message.lower()
