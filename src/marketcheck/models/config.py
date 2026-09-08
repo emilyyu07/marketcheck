@@ -63,6 +63,26 @@ class ValidationConfig(BaseModel):
     session boundary — which is what keeps the rule frequency-agnostic.
     """
 
+    gap_min_missing_bars: int = 1
+    """GapsWithinSession: minimum missing bars for a hole to be reported.
+
+    Default 1 reports every gap. Single missing bars are common in real data —
+    many vendors emit no bar for a minute with no trades — but they still matter
+    for a backtest that assumes every bar exists, so the honest default is to
+    report them and let `largest_gap_bars` convey magnitude. Raise this to
+    suppress noise on illiquid names.
+    """
+
+    gap_frequency_dominance: float = 0.5
+    """GapsWithinSession: fraction of deltas the modal bar spacing must EXCEED.
+
+    Default 0.5 requires a strict majority. Guards against irregular data (tick
+    or event data), where no fixed grid exists, the modal delta is arbitrary, and
+    almost every interval would otherwise be reported as a gap. The strict
+    comparison also rejects a perfect two-way tie as ambiguous rather than
+    resolving it arbitrarily.
+    """
+
     split_ratio_tolerance: float = 0.02
     """Relative tolerance when matching a price ratio to a known stock-split ratio.
 
