@@ -1,9 +1,11 @@
-"""Temporal validation rules (4 rules; 3 implemented)."""
+"""Temporal validation rules (4 rules)."""
 
+from datetime import time
 from typing import cast
 
 import polars as pl
 
+from marketcheck.ingestion.schema import TZ_MIXED
 from marketcheck.models.dataset import CanonicalDataset
 from marketcheck.models.enums import Category, Severity, Status
 from marketcheck.models.result import ValidationResult
@@ -388,6 +390,40 @@ class OutsideTradingHours(ValidationRule):
         )
 
 
+'''
+Rule: Timezone Inconsistency
+Checks whether the timestamps can be interpreted as a single, consistent
+timezone, specifically as the ET wall-clock that every other temporal rule
+assumes.
+
+Two independent detections, covering disjoint failure modes:
+1. Metadata - what the source actually declared, recorded during ingestion
+2. Heuristic - naive timestamps that do not look like ET at all
+
+Key notes:
+- consistent timezone declarations are not flagged
+- shifts searched in 30-minute increments
+- reported shift is difference from ET, not source's UTC offset (e.g. India +05:30 appears as +10:30)
+- OutsideTradingHours will usually also fire when the heuristic does. Both are
+  allowed to report: this rule names the cause, other details the symptoms
+
+'''
+# --- Heuristic calibration (constants) -------------------------------------------------------------
+# Minimum distinct times-of-day before a shift is even considered. Daily data has
+# exactly one, which is what makes the daily-data trap avoidable.
+_MIN_DISTINCT_TIMES = 10
+# A shift must place at least this fraction of bars inside the session to be
+# credible evidence of a timezone difference.
+_MIN_SHIFTED_ALIGNMENT = 0.90
+# ...and the data must currently align no better than this, otherwise there is
+# nothing wrong to explain.
+_MAX_CURRENT_ALIGNMENT = 0.50
+# Candidate shifts, in minutes: every 30 minutes across the range of real world
+# offsets relative to ET.
+_SHIFT_STEP_MINUTES = 30
+_SHIFT_RANGE_MINUTES = (-12 * 60, 14 * 60)
+
+
 @register
 class TimezoneInconsistency(ValidationRule):
     rule_id = "temporal.timezone_inconsistency"
@@ -396,4 +432,153 @@ class TimezoneInconsistency(ValidationRule):
     default_severity = Severity.CRITICAL
 
     def validate(self, dataset: CanonicalDataset, context: RuleContext) -> ValidationResult:
-        raise NotImplementedError("TODO: implement temporal.timezone_inconsistency")
+        df = dataset.df
+
+        def _result(
+            status: Status, message: str, details: dict[str, object] | None = None
+        ) -> ValidationResult:
+            return ValidationResult(
+                rule_id=self.rule_id,
+                rule_name=self.rule_name,
+                category=self.category,
+                severity=self.default_severity,
+                status=status,
+                message=message,
+                details=details or {},
+                affected_rows=df.height if status == Status.FAIL else 0,
+            )
+
+        # MissingColumns owns absent columns.
+        if "timestamp" not in df.columns:
+            return _result(Status.SKIP, "No timestamp column present; skipped.")
+
+        # ---- Detection 1: what the source declared -------------------------
+        # A column mixing offset-bearing and offset-free values cannot be parsed
+        # as one type, so those rows became nulls during coercion. That is a true
+        # inconsistency: the rows do not share a frame of reference.
+        if dataset.source_timezone == TZ_MIXED:
+            return _result(
+                Status.FAIL,
+                "Timestamps mix timezone-aware and timezone-naive values, so they "
+                "do not share a single frame of reference; the unparseable rows "
+                "became null during loading.",
+                {"source_timezone": TZ_MIXED},
+            )
+
+        timestamps = df.get_column("timestamp").drop_nulls()
+        if timestamps.len() == 0:
+            return _result(
+                Status.SKIP, "No usable timestamps to inspect; skipped."
+            )
+
+        # ---- Detection 2: heuristic on the values themselves ---------------
+        # Guard: without several distinct times-of-day a uniform shift cannot be
+        # told apart from the data simply being daily (bars stamped 00:00).
+        minutes_of_day = (
+            timestamps.dt.hour().cast(pl.Int64) * 60 + timestamps.dt.minute().cast(pl.Int64)
+        )
+        distinct_times = minutes_of_day.n_unique()
+        if distinct_times < _MIN_DISTINCT_TIMES:
+            return _result(
+                Status.SKIP,
+                f"Only {distinct_times} distinct time(s) of day, too few to "
+                "distinguish a timezone shift from daily data; skipped.",
+                {"distinct_times_of_day": distinct_times},
+            )
+
+        open_minutes = _minutes(context.calendar.regular_open())
+        close_minutes = _minutes(context.calendar.regular_close())
+        total = minutes_of_day.len()
+
+        def alignment(shift: int) -> float:
+            """Fraction of bars landing inside the session after shifting by
+            `shift` minutes. Wraps modulo 24h so a shift across midnight behaves
+            the same as any other."""
+            shifted = (minutes_of_day + shift) % (24 * 60)
+            inside = ((shifted >= open_minutes) & (shifted < close_minutes)).sum()
+            return int(inside) / total
+
+        current = alignment(0)
+        # Nothing to explain if the data already sits in the session.
+        if current > _MAX_CURRENT_ALIGNMENT:
+            return _result(
+                Status.PASS,
+                "Timestamps are consistent with ET wall-clock.",
+                _calibration({"current_alignment": round(current, 4)}),
+            )
+
+        candidates = range(
+            _SHIFT_RANGE_MINUTES[0], _SHIFT_RANGE_MINUTES[1] + 1, _SHIFT_STEP_MINUTES
+        )
+        best_shift, best_alignment = 0, current
+        for shift in candidates:
+            if shift == 0:
+                continue
+            score = alignment(shift)
+            # Ties resolve to the smaller absolute shift: the least surprising
+            # explanation, and it keeps the result deterministic.
+            if score > best_alignment or (
+                score == best_alignment and abs(shift) < abs(best_shift)
+            ):
+                best_shift, best_alignment = shift, score
+
+        if best_shift == 0 or best_alignment < _MIN_SHIFTED_ALIGNMENT:
+            # Poorly aligned, but no uniform shift explains it -- so the cause is
+            # not a timezone. OutsideTradingHours owns reporting the bars.
+            return _result(
+                Status.PASS,
+                "No uniform timezone shift explains the timestamps; "
+                "not a timezone problem.",
+                _calibration(
+                    {
+                        "current_alignment": round(current, 4),
+                        "best_alignment": round(best_alignment, 4),
+                    }
+                ),
+            )
+
+        offset_label = _format_offset(best_shift)
+        return _result(
+            Status.FAIL,
+            f"Timestamps do not look like ET wall-clock: only {current:.0%} of bars "
+            f"fall inside the trading session, but {best_alignment:.0%} would if "
+            f"shifted by {offset_label}. Every temporal check assumes ET, so all of "
+            "them are unreliable until this is resolved.",
+            _calibration(
+                {
+                    "source_timezone": dataset.source_timezone,
+                    "current_alignment": round(current, 4),
+                    "suggested_shift": offset_label,
+                    "suggested_shift_minutes": best_shift,
+                    "alignment_after_shift": round(best_alignment, 4),
+                    "distinct_times_of_day": distinct_times,
+                }
+            ),
+        )
+
+
+def _minutes(value: time) -> int:
+    """Minutes since midnight for a `time`."""
+    return value.hour * 60 + value.minute
+
+
+def _format_offset(minutes: int) -> str:
+    """Render a shift in minutes as a signed offset, e.g. `-5:00`, `+10:30`."""
+    sign = "+" if minutes >= 0 else "-"
+    hours, mins = divmod(abs(minutes), 60)
+    return f"{sign}{hours}:{mins:02d}"
+
+
+def _calibration(details: dict[str, object]) -> dict[str, object]:
+    """Attach the calibration constants so the inference stays auditable.
+
+    The thresholds are not configurable, but hiding them would make a CRITICAL
+    finding unverifiable -- the same reason VolumeAnomaly echoes its multiplier
+    and window.
+    """
+    return {
+        **details,
+        "min_distinct_times_of_day": _MIN_DISTINCT_TIMES,
+        "min_alignment_after_shift": _MIN_SHIFTED_ALIGNMENT,
+        "max_current_alignment": _MAX_CURRENT_ALIGNMENT,
+    }
