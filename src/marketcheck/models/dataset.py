@@ -38,3 +38,16 @@ class CanonicalDataset(BaseModel):
 
     inferred_frequency: str = ""
     """Inferred bar frequency (e.g. '1min', '5min', '1d')."""
+
+    source_timezone: str | None = None
+    """What timezone information the SOURCE timestamps carried, before coercion.
+
+    Coercion normalises timestamps to naive ET wall-clock, which destroys the
+    original representation, so this is recorded during ingestion for
+    `temporal.timezone_inconsistency` to report on.
+
+    One of: `None` (no timestamp column), a timezone name such as `"UTC"` (the
+    source was timezone-aware), `"naive"` (no timezone information), `"mixed"`
+    (offset-bearing and offset-free values in the same column, which cannot be
+    parsed as one type and silently becomes nulls), or `"unparsed"`.
+    """

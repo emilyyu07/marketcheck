@@ -10,7 +10,7 @@ from pathlib import Path
 
 import polars as pl
 
-from marketcheck.ingestion.schema import coerce_dtypes
+from marketcheck.ingestion.schema import coerce_dtypes, describe_timestamp_timezone
 from marketcheck.models.dataset import CanonicalDataset
 
 
@@ -27,6 +27,10 @@ def to_canonical(df: pl.DataFrame, source_path: str | Path) -> CanonicalDataset:
     Returns:
         A CanonicalDataset ready for validation.
     """
+    # Recorded BEFORE coercion: coercion normalises timestamps to naive ET
+    # wall-clock, after which the source representation cannot be recovered.
+    source_timezone = describe_timestamp_timezone(df)
+
     df = coerce_dtypes(df)
 
     # Extract metadata
@@ -52,4 +56,5 @@ def to_canonical(df: pl.DataFrame, source_path: str | Path) -> CanonicalDataset:
         row_count=row_count,
         start_time=start_time,
         end_time=end_time,
+        source_timezone=source_timezone,
     )
