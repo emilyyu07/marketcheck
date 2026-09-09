@@ -486,6 +486,33 @@ Plumbing was the least-tested code in the project and where every defect lived.
 - `test_reporting.py`: **new, 25 tests.** The reporting layer previously had none.
 - `test_config_file.py`: **new, 14 tests.**
 
+### `InvalidDtypes` reported a vacuous pass (found after the SKIP sweep)
+
+`structural.invalid_dtypes` returned `PASS` with "All column dtypes match the expected
+schema" **after inspecting zero columns**. Its mismatch comprehension filters on
+`if col in df.columns`, so a file with no expected columns produced an empty mismatch set,
+which fell through to the PASS branch. A file of `alpha,beta,gamma` therefore reported
+`missing_columns: fail` alongside `invalid_dtypes: pass`.
+
+Missed in the original sweep because both greps keyed on markers this rule lacks — a
+`"skipped."` message and a `height` guard. It was the only rule in the registry with no skip
+path other than `missing_columns` (correct by design: it inspects the column list, which
+always exists) and the stub.
+
+Two fixes:
+1. **Skip when nothing is inspectable** — no expected columns present now yields `SKIP`,
+   mirroring the `NullValues` `if not checked_cols` guard.
+2. **Pass message states coverage** — "All 6 expected columns have correct dtypes" versus
+   "All 1 of 6 expected column(s) present have correct dtypes". The old wording overstated a
+   check of one column as verification of the whole schema. Status is unchanged: the rule did
+   genuinely verify what was there.
+
+Verified not to be bugs while investigating: `InvalidDtypes` does **not** double-report absent
+columns (it ignores them, so `MissingColumns` retains ownership), and unparseable text such as
+`close = "abc"` casting to `Float64`-with-nulls is the documented limitation already covered by
+`test_warn_unparseable_source_value_reported_as_null`, not a regression from making
+`coerce_dtypes()` tolerant.
+
 **`TimezoneInconsistency` — deliberately deferred, not just "not yet gotten to."**
 Investigated first (before `OutsideTradingHours`) since it looked like the
 lowest-dependency temporal rule (no `MarketCalendar` needed). That
@@ -754,7 +781,7 @@ one" reasoning this document already floated for a possible
 
 ## Test status
 
-`pytest` → **388 passed, 2 skipped, 0 failed** (last run confirmed this session). The
+`pytest` → **392 passed, 2 skipped, 0 failed** (last run confirmed this session). The
 1 skip is `TestStructuralRulesRegistered::test_stub_rules_raise_not_implemented`,
 which is parametrized over `STUB_STRUCTURAL_RULES` — now empty since all 5
 structural rules are implemented, so pytest emits a harmless empty-parametrization
@@ -888,7 +915,7 @@ consistent as new rules are added.
 
 ```bash
 uv sync                                  # install deps
-pytest                                   # run tests (388 passing, 2 skipped baseline)
+pytest                                   # run tests (392 passing, 2 skipped baseline)
 ruff check .                             # lint
 marketcheck validate <file> --format json
 ```

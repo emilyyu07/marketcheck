@@ -187,6 +187,46 @@ class TestInvalidDtypes:
 
     # --- FAIL cases ---------------------------------------------------------
 
+    def test_skip_no_expected_columns_present(self) -> None:
+        """REGRESSION GUARD. With no expected columns the mismatch set is empty,
+        which used to fall through to PASS and claim "all column dtypes match"
+        after inspecting zero columns — the same false assurance as reporting an
+        unrun rule as a pass."""
+        df = pl.DataFrame({"alpha": [1, 2], "beta": [3, 4]})
+        result = InvalidDtypes().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.SKIP
+        assert "none of the expected columns" in result.message.lower()
+
+    def test_pass_message_states_full_coverage(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        """When every expected column is present, say so plainly."""
+        result = InvalidDtypes().validate(
+            _make_dataset(sample_ohlcv_df), _make_context()
+        )
+
+        assert result.status == Status.PASS
+        assert "All 6 expected columns" in result.message
+
+    def test_pass_message_states_partial_coverage(self) -> None:
+        """A check of 1 of 6 columns must not be reported as if the whole schema
+        were verified."""
+        df = pl.DataFrame(
+            {"timestamp": [datetime(2024, 1, 2, 9, 30)]},
+            schema={"timestamp": pl.Datetime("us")},
+        )
+        result = InvalidDtypes().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.PASS
+        assert "1 of 6" in result.message
+
+    def test_partial_coverage_still_detects_a_bad_dtype(self) -> None:
+        """Reporting partial coverage must not weaken detection within it."""
+        df = pl.DataFrame({"close": ["not-a-number"]}, schema={"close": pl.String})
+        result = InvalidDtypes().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.FAIL
+        assert "close" in result.message
+
     def test_fail_single_wrong_dtype(self, sample_ohlcv_df: pl.DataFrame) -> None:
         """One column with wrong dtype → FAIL with that column in details."""
         # Cast volume to Float64 to simulate a column that wasn't coerced correctly.

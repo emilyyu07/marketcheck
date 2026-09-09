@@ -73,20 +73,48 @@ class InvalidDtypes(ValidationRule):
     def validate(self, dataset: CanonicalDataset, context: RuleContext) -> ValidationResult:
         df = dataset.df
 
+        # Only columns that exist can have their dtype judged; MissingColumns owns
+        # absence, so listing missing columns here would double-report.
+        checked_cols = [col for col in EXPECTED_DTYPES if col in df.columns]
+
+        # If NOTHING is inspectable there is no verdict to give. Without this
+        # guard the mismatch dict below is empty and falls through to PASS,
+        # claiming "all dtypes match" after checking zero columns -- the same
+        # false assurance as reporting an unrun rule as a pass.
+        if not checked_cols:
+            return ValidationResult(
+                rule_id=self.rule_id,
+                rule_name=self.rule_name,
+                category=self.category,
+                severity=self.default_severity,
+                status=Status.SKIP,
+                message="None of the expected columns are present; skipped.",
+            )
+
         mismatches = {
-            col: {"expected": str(expected_dtype), "actual": str(df.schema[col])}
-            for col, expected_dtype in EXPECTED_DTYPES.items()
-            if col in df.columns and df.schema[col] != expected_dtype
+            col: {"expected": str(EXPECTED_DTYPES[col]), "actual": str(df.schema[col])}
+            for col in checked_cols
+            if df.schema[col] != EXPECTED_DTYPES[col]
         }
 
         if not mismatches:
+            # State how much was actually inspected. "All column dtypes match the
+            # expected schema" would overstate a check of 1 of 6 columns.
+            total_expected = len(EXPECTED_DTYPES)
+            if len(checked_cols) == total_expected:
+                message = f"All {total_expected} expected columns have correct dtypes."
+            else:
+                message = (
+                    f"All {len(checked_cols)} of {total_expected} expected column(s) "
+                    "present have correct dtypes."
+                )
             return ValidationResult(
                 rule_id=self.rule_id,
                 rule_name=self.rule_name,
                 category=self.category,
                 severity=self.default_severity,
                 status=Status.PASS,
-                message="All column dtypes match the expected schema.",
+                message=message,
             )
 
         return ValidationResult(
