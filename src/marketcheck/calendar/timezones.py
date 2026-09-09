@@ -43,7 +43,8 @@ def normalize_to_utc(df: pl.DataFrame, column: str = "timestamp") -> pl.DataFram
     """
 
     # normalize (takes a timezone-aware dattime and coverts into different timezone)
-    # convert_time_zone is used to convert the timestamp values to UTC, adjusting clock values accordingly
+    # convert_time_zone is used to convert the timestamp values to UTC,
+    # adjusting clock values accordingly
     return df.with_columns(
         pl.col(column).dt.convert_time_zone("UTC")
     )

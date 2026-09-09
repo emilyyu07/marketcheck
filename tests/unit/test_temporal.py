@@ -107,19 +107,19 @@ class TestOutsideTradingHours:
         assert result.affected_rows == 0
         assert result.details == {}
 
-    def test_pass_empty_dataset(self) -> None:
+    def test_skip_empty_dataset(self) -> None:
         """Zero rows means nothing to check -> PASS."""
         df = pl.DataFrame({"timestamp": []}, schema={"timestamp": pl.Datetime("us")})
         result = OutsideTradingHours().validate(_make_dataset(df), _make_context())
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
-    def test_pass_timestamp_column_missing(self, sample_ohlcv_df: pl.DataFrame) -> None:
+    def test_skip_timestamp_column_missing(self, sample_ohlcv_df: pl.DataFrame) -> None:
         """No timestamp column -> PASS (skip); MissingColumns owns this concern."""
         df = sample_ohlcv_df.drop("timestamp")
         result = OutsideTradingHours().validate(_make_dataset(df), _make_context())
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
     def test_pass_exact_open_boundary_is_regular_hours(self) -> None:
         """Exactly 09:30:00 is regular hours (market opens then) -> PASS."""
@@ -317,29 +317,30 @@ class TestMissingSessions:
 
         assert result.status == Status.PASS
 
-    def test_pass_timestamp_column_missing(self, sample_ohlcv_df: pl.DataFrame) -> None:
+    def test_skip_timestamp_column_missing(self, sample_ohlcv_df: pl.DataFrame) -> None:
         """No timestamp column -> PASS (skip); MissingColumns owns this."""
         df = sample_ohlcv_df.drop("timestamp")
         result = MissingSessions().validate(_make_dataset(df), _make_context())
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
-    def test_pass_empty_dataset(self) -> None:
+    def test_skip_empty_dataset(self) -> None:
         """Zero rows -> no derivable range -> PASS."""
         df = pl.DataFrame({"timestamp": []}, schema={"timestamp": pl.Datetime("us")})
         result = MissingSessions().validate(_make_dataset(df), _make_context())
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
-    def test_pass_all_null_timestamps(self) -> None:
-        """All-null timestamps yield no usable dates -> PASS, not a crash.
-        NullValues owns reporting the nulls themselves."""
+    def test_skip_all_null_timestamps(self) -> None:
+        """All-null timestamps yield no usable dates, so there is no range to
+        check -> SKIP, not a crash and not a vacuous pass. NullValues owns
+        reporting the nulls themselves."""
         df = pl.DataFrame(
             {"timestamp": [None, None]}, schema={"timestamp": pl.Datetime("us")}
         )
         result = MissingSessions().validate(_make_dataset(df), _make_context())
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
     def test_pass_intraday_rows_same_date_not_duplicated(self) -> None:
         """Many rows on one date collapse to a single present session."""
@@ -521,23 +522,23 @@ class TestGapsWithinSession:
         assert result.status == Status.PASS
         assert result.details["inferred_frequency"] == "5min"
 
-    def test_pass_timestamp_column_missing(self) -> None:
+    def test_skip_timestamp_column_missing(self) -> None:
         """MissingColumns owns absent columns."""
         df = pl.DataFrame({"close": [1.0, 2.0]}, schema={"close": pl.Float64})
         result = GapsWithinSession().validate(_make_dataset(df), _make_context())
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
-    def test_pass_single_row(self) -> None:
+    def test_skip_single_row(self) -> None:
         """One row cannot form a delta."""
         result = GapsWithinSession().validate(_make_dataset(_bars([0])), _make_context())
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
-    def test_pass_empty_dataset(self) -> None:
+    def test_skip_empty_dataset(self) -> None:
         result = GapsWithinSession().validate(_make_dataset(_bars([])), _make_context())
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
     def test_pass_standard_fixture(self, sample_ohlcv_df: pl.DataFrame) -> None:
         """The shared fixture is 10 contiguous minute bars."""
@@ -547,7 +548,7 @@ class TestGapsWithinSession:
 
         assert result.status == Status.PASS
 
-    def test_pass_daily_data_self_skips(self) -> None:
+    def test_skip_daily_data_self_skips(self) -> None:
         """KEY PROPERTY: for daily data every delta spans a session boundary, so
         no within-session interval exists to analyse. The rule skips with no
         special-casing — correct, because 'gap within a session' is meaningless
@@ -557,7 +558,7 @@ class TestGapsWithinSession:
             _make_context(),
         )
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
         assert "one bar per session" in result.message
 
     def test_pass_overnight_gap_not_reported(self) -> None:
@@ -569,7 +570,7 @@ class TestGapsWithinSession:
 
         assert result.status == Status.PASS
 
-    def test_pass_irregular_data_skipped(self) -> None:
+    def test_skip_irregular_data_skipped(self) -> None:
         """THE DOMINANCE GUARD. Tick-like data has no fixed grid, so the modal
         delta is arbitrary and nearly every interval would look like a gap. The
         rule must decline rather than emit a flood of false positives."""
@@ -577,10 +578,10 @@ class TestGapsWithinSession:
             _make_dataset(_bars([0, 1, 3, 6, 10, 15, 21])), _make_context()
         )
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
         assert "could not infer" in result.message.lower()
 
-    def test_pass_ambiguous_tie_skipped(self) -> None:
+    def test_skip_ambiguous_tie_skipped(self) -> None:
         """A perfect two-way tie (each spacing exactly half the intervals) is
         ambiguous. The dominance comparison is strict precisely so this is
         rejected rather than resolved arbitrarily by the tie-break."""
@@ -589,10 +590,10 @@ class TestGapsWithinSession:
             _make_dataset(_bars([0, 1, 2, 7, 12])), _make_context()
         )
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
         assert "could not infer" in result.message.lower()
 
-    def test_pass_confidence_reported_when_inference_rejected(self) -> None:
+    def test_skip_confidence_reported_when_inference_rejected(self) -> None:
         """The confidence is disclosed even on failure, so the skip is auditable."""
         result = GapsWithinSession().validate(
             _make_dataset(_bars([0, 1, 3, 6, 10, 15, 21])), _make_context()

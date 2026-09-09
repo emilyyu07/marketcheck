@@ -12,6 +12,8 @@ _STATUS_ICON = {
     Status.PASS: "✓",
     Status.WARN: "⚠",
     Status.FAIL: "✗",
+    # Visually neutral on purpose: a skip is neither success nor failure.
+    Status.SKIP: "–",
 }
 
 
@@ -35,6 +37,8 @@ def render_text(summary: DatasetSummary) -> str:
     if summary.ticker:
         lines.append(f"  Ticker: {summary.ticker}")
     lines.append(f"  Rows:   {summary.row_count:,}")
+    if summary.overall_message:
+        lines.append(f"  Note:   {summary.overall_message}")
     if summary.start_time:
         lines.append(f"  Range:  {summary.start_time} → {summary.end_time}")
     lines.append("")

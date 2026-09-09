@@ -63,8 +63,8 @@ class OhlcRangeViolation(ValidationRule):
                 rule_name=self.rule_name,
                 category=self.category,
                 severity=self.default_severity,
-                status=Status.PASS,
-                message="All rows have valid OHLC ranges.",
+                status=Status.SKIP,
+                message="No OHLC columns to compare, or no rows; skipped.",
             )
 
         # One boolean column per check. `high < low` style names encode the
@@ -174,8 +174,8 @@ class ImpossibleValues(ValidationRule):
                 rule_name=self.rule_name,
                 category=self.category,
                 severity=self.default_severity,
-                status=Status.PASS,
-                message="No impossible values found.",
+                status=Status.SKIP,
+                message="No price or volume columns to inspect, or no rows; skipped.",
             )
 
         check_names = [name for name, _ in checks]
@@ -286,7 +286,7 @@ class VolumeAnomaly(ValidationRule):
                 rule_name=self.rule_name,
                 category=self.category,
                 severity=self.default_severity,
-                status=Status.PASS,
+                status=Status.SKIP,
                 message="No volume column present; skipped.",
             )
 
@@ -296,8 +296,8 @@ class VolumeAnomaly(ValidationRule):
                 rule_name=self.rule_name,
                 category=self.category,
                 severity=self.default_severity,
-                status=Status.PASS,
-                message="No volume anomalies detected.",
+                status=Status.SKIP,
+                message="No rows to inspect; skipped.",
             )
 
         multiplier = context.config.volume_anomaly_multiplier
@@ -408,7 +408,7 @@ class SuspiciousPriceJump(ValidationRule):
                 rule_name=self.rule_name,
                 category=self.category,
                 severity=self.default_severity,
-                status=Status.PASS,
+                status=Status.SKIP,
                 message="No close column present; skipped.",
             )
 
@@ -419,8 +419,8 @@ class SuspiciousPriceJump(ValidationRule):
                 rule_name=self.rule_name,
                 category=self.category,
                 severity=self.default_severity,
-                status=Status.PASS,
-                message="No suspicious price jumps detected.",
+                status=Status.SKIP,
+                message="Fewer than 2 rows, so no price move can be computed; skipped.",
             )
 
         intraday_threshold = context.config.price_jump_intraday_threshold

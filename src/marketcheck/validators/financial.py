@@ -26,28 +26,37 @@ class CorporateActionDiscontinuity(ValidationRule):
     def validate(self, dataset: CanonicalDataset, context: RuleContext) -> ValidationResult:
         df = dataset.df
 
-        def _pass(message: str) -> ValidationResult:
+        def _result(status: Status, message: str) -> ValidationResult:
             return ValidationResult(
                 rule_id=self.rule_id,
                 rule_name=self.rule_name,
                 category=self.category,
                 severity=self.default_severity,
-                status=Status.PASS,
+                status=status,
                 message=message,
             )
+
+        def _pass(message: str) -> ValidationResult:
+            """Rule evaluated the data and found nothing wrong."""
+            return _result(Status.PASS, message)
+
+        def _skip(message: str) -> ValidationResult:
+            """Rule could not evaluate the data. Never reported as a pass, since
+            "I did not check this" is not the same as "this is fine"."""
+            return _result(Status.SKIP, message)
 
         # MissingColumns owns absent columns. `close` is the signal and
         # `timestamp` is required to identify session boundaries -- a split only
         # ever takes effect between sessions, so without dates this rule has no
         # way to distinguish a split from an intraday bad tick and must not guess.
         if "close" not in df.columns:
-            return _pass("No close column present; skipped.")
+            return _skip("No close column present; skipped.")
         if "timestamp" not in df.columns:
-            return _pass("No timestamp column present; cannot identify sessions; skipped.")
+            return _skip("No timestamp column present; cannot identify sessions; skipped.")
 
         # Need at least one consecutive pair to form a ratio.
         if df.height < 2:
-            return _pass("No corporate-action discontinuities detected.")
+            return _skip("Fewer than 2 rows, so no price ratio can be computed; skipped.")
 
         tolerance = context.config.split_ratio_tolerance
         has_volume = "volume" in df.columns

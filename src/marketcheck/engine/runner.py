@@ -19,8 +19,9 @@ def run_validation(
 ) -> list[ValidationResult]:
     """Run all registered validation rules against *dataset*.
 
-    This function iterates through all registered validation rules and applies them to the provided dataset.
-    It collects the results of each rule's execution and returns a list of validation results.
+    Iterates through all registered validation rules, applies each to the provided
+    dataset, and collects one result per rule. A rule that cannot run is recorded
+    as SKIP rather than omitted or reported as a pass.
 
     Args:
         dataset: The canonical dataset to validate.
@@ -38,12 +39,27 @@ def run_validation(
     for rule_cls in REGISTRY:
         rule = rule_cls()
 
-        # Skip disabled rules
+        # A rule the user disabled by name is still REPORTED, as a skip. Omitting
+        # it entirely would leave a reader unable to tell "14 rules, 3 disabled"
+        # from "this tool only has 11 rules" -- the same opacity as reporting an
+        # unimplemented rule as a pass.
         if rule.rule_id in config.disabled_rules:
             logger.debug("Skipping disabled rule: %s", rule.rule_id)
+            results.append(
+                ValidationResult(
+                    rule_id=rule.rule_id,
+                    rule_name=rule.rule_name,
+                    category=rule.category,
+                    severity=rule.default_severity,
+                    status=Status.SKIP,
+                    message="Rule disabled by configuration.",
+                )
+            )
             continue
 
-        # Skip rules outside enabled categories (if filter is set)
+        # A category filter, by contrast, is an explicit narrowing of scope: the
+        # user asked for one category, so listing every other rule as skipped
+        # would be noise rather than transparency. Those are omitted.
         if config.enabled_categories and rule.category.value not in config.enabled_categories:
             logger.debug("Skipping rule outside enabled categories: %s", rule.rule_id)
             continue
@@ -53,14 +69,16 @@ def run_validation(
             results.append(result)
         except NotImplementedError as exc:
             logger.warning("Rule not yet implemented, skipping: %s (%s)", rule.rule_id, exc)
-            # Append a PASS placeholder so the report reflects that this rule was seen
+            # Record the rule as SKIPPED, never as passed. A PASS placeholder here
+            # would inflate total_passed and tell the user an unimplemented check
+            # had verified their data.
             results.append(
                 ValidationResult(
                     rule_id=rule.rule_id,
                     rule_name=rule.rule_name,
                     category=rule.category,
                     severity=rule.default_severity,
-                    status=Status.PASS,
+                    status=Status.SKIP,
                     message=f"Rule not yet implemented: {rule.rule_id}",
                 )
             )

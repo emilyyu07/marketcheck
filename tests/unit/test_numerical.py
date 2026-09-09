@@ -138,12 +138,12 @@ class TestOhlcRangeViolation:
         assert result.affected_rows == 0
         assert result.details == {}
 
-    def test_pass_empty_dataset(self) -> None:
+    def test_skip_empty_dataset(self) -> None:
         """Zero rows -> PASS."""
         df = _bar().head(0)
         result = OhlcRangeViolation().validate(_make_dataset(df), _make_context())
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
     def test_pass_all_four_prices_equal(self) -> None:
         """A flat bar (open==high==low==close) is valid: all invariants use
@@ -160,7 +160,7 @@ class TestOhlcRangeViolation:
 
         assert result.status == Status.PASS
 
-    def test_pass_ohlc_column_missing(self, sample_ohlcv_df: pl.DataFrame) -> None:
+    def test_skip_ohlc_column_missing(self, sample_ohlcv_df: pl.DataFrame) -> None:
         """Dropping OHLC columns must not crash; MissingColumns owns absence.
 
         With only `close` left, no check has both operands present, so there is
@@ -169,7 +169,7 @@ class TestOhlcRangeViolation:
         df = sample_ohlcv_df.drop(["open", "high", "low"])
         result = OhlcRangeViolation().validate(_make_dataset(df), _make_context())
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
     def test_pass_nulls_excluded(self) -> None:
         """A null price must not produce a violation; NullValues owns nulls."""
@@ -367,18 +367,18 @@ class TestVolumeAnomaly:
 
         assert result.status == Status.PASS
 
-    def test_pass_volume_column_missing(self, sample_ohlcv_df: pl.DataFrame) -> None:
+    def test_skip_volume_column_missing(self, sample_ohlcv_df: pl.DataFrame) -> None:
         """No volume column -> PASS (skip); MissingColumns owns absence."""
         df = sample_ohlcv_df.drop("volume")
         result = VolumeAnomaly().validate(_make_dataset(df), _make_context())
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
-    def test_pass_empty_dataset(self) -> None:
+    def test_skip_empty_dataset(self) -> None:
         """Zero rows -> PASS."""
         result = VolumeAnomaly().validate(_make_dataset(_volume_df([])), _make_context())
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
     def test_pass_genuine_event_sized_spike_not_flagged(self) -> None:
         """A 4x spike — the size of a real earnings/news day — must NOT be
@@ -651,11 +651,11 @@ class TestImpossibleValues:
         assert result.affected_rows == 0
         assert result.details == {}
 
-    def test_pass_empty_dataset(self) -> None:
+    def test_skip_empty_dataset(self) -> None:
         """Zero rows -> PASS."""
         result = ImpossibleValues().validate(_make_dataset(_bar().head(0)), _make_context())
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
     def test_pass_zero_volume_is_legitimate(self) -> None:
         """THE key asymmetry: volume == 0 is legitimate (illiquid name, halted
@@ -666,12 +666,12 @@ class TestImpossibleValues:
 
         assert result.status == Status.PASS
 
-    def test_pass_all_columns_missing(self) -> None:
+    def test_skip_all_columns_missing(self) -> None:
         """No price or volume columns -> nothing checkable -> PASS."""
         df = pl.DataFrame({"timestamp": [datetime(2024, 1, 2, 9, 30)]})
         result = ImpossibleValues().validate(_make_dataset(df), _make_context())
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
     def test_pass_null_prices_excluded(self) -> None:
         """A null price is NullValues' concern, not an impossible value."""
@@ -1024,28 +1024,28 @@ class TestSuspiciousPriceJump:
 
         assert result.status == Status.PASS
 
-    def test_pass_close_column_missing(self, sample_ohlcv_df: pl.DataFrame) -> None:
+    def test_skip_close_column_missing(self, sample_ohlcv_df: pl.DataFrame) -> None:
         """No close column -> PASS (skip); MissingColumns owns absence."""
         df = sample_ohlcv_df.drop("close")
         result = SuspiciousPriceJump().validate(_make_dataset(df), _make_context())
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
-    def test_pass_single_row(self) -> None:
+    def test_skip_single_row(self) -> None:
         """One row has no predecessor to compare against."""
         result = SuspiciousPriceJump().validate(
             _make_dataset(_price_df([100.0])), _make_context()
         )
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
-    def test_pass_empty_dataset(self) -> None:
+    def test_skip_empty_dataset(self) -> None:
         """Zero rows -> PASS."""
         result = SuspiciousPriceJump().validate(
             _make_dataset(_price_df([])), _make_context()
         )
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
     def test_pass_null_close_excluded(self) -> None:
         """A null close cannot form a ratio; NullValues owns nulls."""

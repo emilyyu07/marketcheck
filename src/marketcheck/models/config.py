@@ -4,13 +4,28 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import BaseModel
-
-from marketcheck.models.enums import Severity
+from pydantic import BaseModel, ConfigDict
 
 
 class ValidationConfig(BaseModel):
-    """Runtime configuration for a validation run."""
+    """Runtime configuration for a validation run.
+
+    Unknown keys are rejected rather than ignored. Pydantic's default is to drop
+    them silently, which would mean a typo like `volume_anomly_multiplier` left
+    the user believing they had configured something they had not -- the same
+    class of quiet dishonesty as reporting an unrun check as a pass.
+
+    `severity_overrides` was deliberately removed rather than implemented. Each
+    rule declares one class-level severity AND hardcodes the status it returns
+    (VolumeAnomaly returns WARN; CorporateActionDiscontinuity maps INFO -> WARN).
+    Overriding severity alone would produce incoherent results such as
+    `severity=critical, status=warn`, and making it coherent would mean deriving
+    status from severity, destroying those deliberate pairings. The real needs it
+    implied are already served: `strict` escalates warnings for CI, and
+    `disabled_rules` silences a rule entirely.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     strict: bool = False
     """If True, treat WARNINGs as FAILs."""
@@ -20,9 +35,6 @@ class ValidationConfig(BaseModel):
 
     disabled_rules: list[str] = []
     """Rule IDs to skip."""
-
-    severity_overrides: dict[str, Severity] = {}
-    """Override default severity for specific rule IDs."""
 
     max_rows_in_details: int = 50
     """Cap on how many affected rows to include in detailed output."""

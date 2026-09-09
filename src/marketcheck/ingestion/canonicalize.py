@@ -5,6 +5,7 @@ Assemble all raw DataFrames and metadata into a single canonical model for valid
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import polars as pl
@@ -34,8 +35,11 @@ def to_canonical(df: pl.DataFrame, source_path: str | Path) -> CanonicalDataset:
     end_time = None
     if row_count > 0 and "timestamp" in df.columns:
         ts_col = df["timestamp"]
-        start_time = ts_col.min()
-        end_time = ts_col.max()
+        # Series.min()/max() are typed as a broad scalar union; narrow to datetime
+        # so a non-temporal timestamp column cannot silently populate these fields.
+        raw_start, raw_end = ts_col.min(), ts_col.max()
+        start_time = raw_start if isinstance(raw_start, datetime) else None
+        end_time = raw_end if isinstance(raw_end, datetime) else None
 
     # Attempt to extract ticker from filename
     # Heuristic: filename is expected to be in the format "TICKER_text.ext"

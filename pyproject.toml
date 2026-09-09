@@ -30,10 +30,17 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 
 [tool.mypy]
-python_version = "3.11"
+# Matches the interpreter the project actually runs on. Pinning 3.11 here made
+# mypy reject numpy's own stubs, which use 3.12+ `type` statements.
+python_version = "3.14"
 strict = true
 packages = ["marketcheck"]
 mypy_path = "src"
+
+[[tool.mypy.overrides]]
+# pandas_market_calendars ships no py.typed marker or stubs.
+module = ["pandas_market_calendars.*"]
+ignore_missing_imports = true
 
 [dependency-groups]
 dev = [

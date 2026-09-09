@@ -68,6 +68,15 @@ class DatasetSummary(BaseModel):
     overall_status: Status = Status.PASS
     """Worst-case status across all rules."""
 
+    overall_message: str = ""
+    """Why the overall status is what it is, when that is not self-evident.
+
+    Populated when the outcome is driven by something other than an individual
+    rule finding -- a dataset with no rows, or a run in which no rule produced a
+    real verdict. Both cases would otherwise surface as a bare status with no
+    explanation of why nothing was checked.
+    """
+
     total_rules_run: int = 0
     """Number of validation rules that were executed."""
 

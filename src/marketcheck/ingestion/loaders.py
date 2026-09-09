@@ -10,6 +10,7 @@ from pathlib import Path
 
 import polars as pl
 
+
 # for CSV files
 def load_csv(path: str | Path) -> pl.DataFrame:
     """Load a CSV file into a Polars DataFrame.

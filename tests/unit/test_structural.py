@@ -261,26 +261,26 @@ class TestUnsortedTimestamps:
         assert result.affected_rows == 0
         assert result.details == {}
 
-    def test_pass_empty_dataset(self) -> None:
+    def test_skip_empty_dataset(self) -> None:
         """Zero rows means nothing to compare -> PASS."""
         df = pl.DataFrame({"timestamp": []}, schema={"timestamp": pl.Datetime("us")})
         result = UnsortedTimestamps().validate(_make_dataset(df), _make_context())
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
-    def test_pass_single_row(self) -> None:
+    def test_skip_single_row(self) -> None:
         """A single row has no predecessor to violate order against -> PASS."""
         df = pl.DataFrame({"timestamp": [datetime(2024, 1, 2, 9, 30)]})
         result = UnsortedTimestamps().validate(_make_dataset(df), _make_context())
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
-    def test_pass_timestamp_column_missing(self, sample_ohlcv_df: pl.DataFrame) -> None:
+    def test_skip_timestamp_column_missing(self, sample_ohlcv_df: pl.DataFrame) -> None:
         """No timestamp column -> PASS (skip); MissingColumns owns this concern."""
         df = sample_ohlcv_df.drop("timestamp")
         result = UnsortedTimestamps().validate(_make_dataset(df), _make_context())
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
     def test_pass_duplicate_timestamps_not_flagged(self, sample_ohlcv_df: pl.DataFrame) -> None:
         """Equal consecutive timestamps (ties) are DuplicateTimestamps' concern, not ours."""
@@ -408,26 +408,26 @@ class TestDuplicateTimestamps:
         assert result.affected_rows == 0
         assert result.details == {}
 
-    def test_pass_empty_dataset(self) -> None:
+    def test_skip_empty_dataset(self) -> None:
         """Zero rows means nothing to compare -> PASS."""
         df = pl.DataFrame({"timestamp": []}, schema={"timestamp": pl.Datetime("us")})
         result = DuplicateTimestamps().validate(_make_dataset(df), _make_context())
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
-    def test_pass_single_row(self) -> None:
+    def test_skip_single_row(self) -> None:
         """A single row can't duplicate anything -> PASS."""
         df = pl.DataFrame({"timestamp": [datetime(2024, 1, 2, 9, 30)]})
         result = DuplicateTimestamps().validate(_make_dataset(df), _make_context())
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
-    def test_pass_timestamp_column_missing(self, sample_ohlcv_df: pl.DataFrame) -> None:
+    def test_skip_timestamp_column_missing(self, sample_ohlcv_df: pl.DataFrame) -> None:
         """No timestamp column -> PASS (skip); MissingColumns owns this concern."""
         df = sample_ohlcv_df.drop("timestamp")
         result = DuplicateTimestamps().validate(_make_dataset(df), _make_context())
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
     def test_pass_multiple_nulls_not_treated_as_duplicates(
         self, sample_ohlcv_df: pl.DataFrame
@@ -619,7 +619,8 @@ class TestNullValues:
         assert result.details == {}
 
     def test_pass_empty_dataset(self) -> None:
-        """Zero rows means zero nulls by construction -> PASS."""
+        """Zero rows means zero nulls by construction. This is a real verdict, not
+        a skip: the columns exist and were inspected, so PASS is honest."""
         df = pl.DataFrame(
             {
                 "timestamp": [],
@@ -642,13 +643,13 @@ class TestNullValues:
 
         assert result.status == Status.PASS
 
-    def test_pass_all_required_columns_missing(self) -> None:
+    def test_skip_all_required_columns_missing(self) -> None:
         """No required columns present -> PASS via the empty-checked-columns guard,
         not treated as 'everything is null'. MissingColumns owns this case."""
         df = pl.DataFrame({"ticker": ["AAPL", "AAPL"]})
         result = NullValues().validate(_make_dataset(df), _make_context())
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
         assert result.affected_rows == 0
         assert result.details == {}
 

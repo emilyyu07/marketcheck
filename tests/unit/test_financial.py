@@ -95,37 +95,37 @@ class TestCorporateActionDiscontinuity:
 
         assert result.status == Status.PASS
 
-    def test_pass_close_column_missing(self, sample_ohlcv_df: pl.DataFrame) -> None:
+    def test_skip_close_column_missing(self, sample_ohlcv_df: pl.DataFrame) -> None:
         """No close column -> skip; MissingColumns owns absence."""
         result = CorporateActionDiscontinuity().validate(
             _make_dataset(sample_ohlcv_df.drop("close")), _make_context()
         )
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
-    def test_pass_timestamp_column_missing(self) -> None:
+    def test_skip_timestamp_column_missing(self) -> None:
         """Without timestamps, sessions can't be identified. The rule must skip
         rather than guess, since a split only occurs between sessions."""
         df = pl.DataFrame({"close": [100.0, 50.0]}, schema={"close": pl.Float64})
         result = CorporateActionDiscontinuity().validate(_make_dataset(df), _make_context())
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
-    def test_pass_single_row(self) -> None:
+    def test_skip_single_row(self) -> None:
         """One row cannot form a ratio."""
         result = CorporateActionDiscontinuity().validate(
             _make_dataset(_daily([100.0])), _make_context()
         )
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
-    def test_pass_empty_dataset(self) -> None:
+    def test_skip_empty_dataset(self) -> None:
         """Zero rows -> PASS."""
         result = CorporateActionDiscontinuity().validate(
             _make_dataset(_daily([])), _make_context()
         )
 
-        assert result.status == Status.PASS
+        assert result.status == Status.SKIP
 
     def test_pass_split_ratio_intraday_is_not_a_split(self) -> None:
         """A split takes effect only between sessions, so an exact halving WITHIN

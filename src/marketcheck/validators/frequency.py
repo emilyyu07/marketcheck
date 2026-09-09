@@ -40,8 +40,9 @@ def infer_frequency(
     Args:
         deltas: Duration series of consecutive timestamp differences (excluding overnight gaps)
         dominance: The winning value must account for more than this
-            fraction of `deltas` (a strict majority at the 0.5 default) -> without this guard, every interval 
-            be reported as a gap
+            fraction of `deltas` (a strict majority at the 0.5 default) -> without
+            this guard, on irregular data with no fixed grid, nearly every
+            interval would be reported as a gap
 
     Returns:
         `(frequency, confidence)` where `frequency` is the modal delta and

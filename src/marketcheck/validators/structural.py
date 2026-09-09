@@ -19,7 +19,6 @@ from marketcheck.models.enums import Category, Severity, Status
 from marketcheck.models.result import ValidationResult
 from marketcheck.validators.base import RuleContext, ValidationRule, register
 
-
 '''
 Rule 1: Missing Required Columns
 Checks if the dataset contains all required columns. 
@@ -130,7 +129,7 @@ class UnsortedTimestamps(ValidationRule):
                 rule_name=self.rule_name,
                 category=self.category,
                 severity=self.default_severity,
-                status=Status.PASS,
+                status=Status.SKIP,
                 message="No timestamp column present; skipped.",
             )
 
@@ -141,8 +140,8 @@ class UnsortedTimestamps(ValidationRule):
                 rule_name=self.rule_name,
                 category=self.category,
                 severity=self.default_severity,
-                status=Status.PASS,
-                message="Timestamps are sorted in ascending order.",
+                status=Status.SKIP,
+                message="Fewer than 2 rows, so sort order is not meaningful; skipped.",
             )
 
         # Vectorized pass: pair each row with its predecessor via shift(1),
@@ -217,17 +216,18 @@ class NullValues(ValidationRule):
         # MissingColumns owns absent columns; only check columns that exist.
         checked_cols = [col for col in REQUIRED_COLUMNS if col in df.columns]
 
-        # Guard: if none of the required columns exist, there's nothing to
-        # check -- PASS trivially rather than depending on unverified
-        # pl.any_horizontal([]) behavior on an empty expression list.
+        # Guard: if none of the required columns exist there is nothing to
+        # inspect, so the rule reports SKIP rather than a vacuous pass. This also
+        # avoids depending on unverified pl.any_horizontal([]) behaviour for an
+        # empty expression list.
         if not checked_cols:
             return ValidationResult(
                 rule_id=self.rule_id,
                 rule_name=self.rule_name,
                 category=self.category,
                 severity=self.default_severity,
-                status=Status.PASS,
-                message="No null values found in required columns.",
+                status=Status.SKIP,
+                message="None of the required columns are present; skipped.",
             )
 
         # Per-column null counts -- only columns with at least one null.
@@ -304,7 +304,7 @@ class DuplicateTimestamps(ValidationRule):
                 rule_name=self.rule_name,
                 category=self.category,
                 severity=self.default_severity,
-                status=Status.PASS,
+                status=Status.SKIP,
                 message="No timestamp column present; skipped.",
             )
 
@@ -315,8 +315,8 @@ class DuplicateTimestamps(ValidationRule):
                 rule_name=self.rule_name,
                 category=self.category,
                 severity=self.default_severity,
-                status=Status.PASS,
-                message="No duplicate timestamps found.",
+                status=Status.SKIP,
+                message="Fewer than 2 rows, so a duplicate is impossible; skipped.",
             )
 
         # Attach the original row index before any filtering/grouping, so

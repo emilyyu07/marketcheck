@@ -1,5 +1,7 @@
 """Temporal validation rules (4 rules; 3 implemented)."""
 
+from typing import cast
+
 import polars as pl
 
 from marketcheck.models.dataset import CanonicalDataset
@@ -34,7 +36,7 @@ class MissingSessions(ValidationRule):
                 rule_name=self.rule_name,
                 category=self.category,
                 severity=self.default_severity,
-                status=Status.PASS,
+                status=Status.SKIP,
                 message="No timestamp column present; skipped.",
             )
 
@@ -48,15 +50,16 @@ class MissingSessions(ValidationRule):
             .to_list()
         )
 
-        # No usable timestamps -> no range to diff over.
+        # No usable timestamps -> no date range to diff against the calendar, so
+        # nothing was verified. SKIP rather than claim no sessions are missing.
         if not dates_present:
             return ValidationResult(
                 rule_id=self.rule_id,
                 rule_name=self.rule_name,
                 category=self.category,
                 severity=self.default_severity,
-                status=Status.PASS,
-                message="No trading sessions missing.",
+                status=Status.SKIP,
+                message="No usable timestamps, so no date range to check; skipped.",
             )
 
         start = min(dates_present)
@@ -107,10 +110,13 @@ Checks whether bars are missing within a trading session (e.g. 1-minute data
 that jumps from 10:15 straight to 10:23)
 
 Key notes:
-- expected spacing is inferred from data itself (most common spacing is the inferred grid size)
-- delta-based, not grid-based: detection compares consecutive bars rather than diffing against a reconstructed timestamp grid from session hours
+- expected spacing is inferred from data itself (most common spacing is the
+  inferred grid size)
+- delta-based, not grid-based: detection compares consecutive bars rather than
+  diffing against a reconstructed timestamp grid from session hours
 - no calendar dependency
-- session boundaries excluded, so overnight gaps are never reported here (MissingSessions owns absent days)
+- session boundaries excluded, so overnight gaps are never reported here
+  (MissingSessions owns absent days)
 
 Mechanics: sort a copy -> drop duplicate timestamps -> take consecutive deltas ->
 discard deltas that span a session boundary -> infer the modal spacing -> any
@@ -127,24 +133,35 @@ class GapsWithinSession(ValidationRule):
     def validate(self, dataset: CanonicalDataset, context: RuleContext) -> ValidationResult:
         df = dataset.df
 
-        def _pass(message: str, details: dict | None = None) -> ValidationResult:
+        def _result(
+            status: Status, message: str, details: dict[str, object] | None = None
+        ) -> ValidationResult:
             return ValidationResult(
                 rule_id=self.rule_id,
                 rule_name=self.rule_name,
                 category=self.category,
                 severity=self.default_severity,
-                status=Status.PASS,
+                status=status,
                 message=message,
                 details=details or {},
             )
 
+        def _pass(message: str, details: dict[str, object] | None = None) -> ValidationResult:
+            """Rule evaluated the data and found no gaps."""
+            return _result(Status.PASS, message, details)
+
+        def _skip(message: str, details: dict[str, object] | None = None) -> ValidationResult:
+            """Rule could not evaluate the data -- no timestamps, no intra-session
+            intervals, or no credible bar frequency. Never reported as a pass."""
+            return _result(Status.SKIP, message, details)
+
         # MissingColumns owns absent columns; skip rather than crash.
         if "timestamp" not in df.columns:
-            return _pass("No timestamp column present; skipped.")
+            return _skip("No timestamp column present; skipped.")
 
         # Need at least two rows to form a single delta.
         if df.height < 2:
-            return _pass("No gaps within sessions detected.")
+            return _skip("Fewer than 2 rows, so no interval exists; skipped.")
 
         min_missing = context.config.gap_min_missing_bars
         dominance = context.config.gap_frequency_dominance
@@ -161,7 +178,9 @@ class GapsWithinSession(ValidationRule):
             .sort("timestamp")
         )
         if ordered.height < 2:
-            return _pass("No gaps within sessions detected.")
+            return _skip(
+                "Fewer than 2 distinct non-null timestamps, so no interval exists; skipped."
+            )
 
         # A session boundary is a change of calendar date. Deltas that span one
         # are excluded from BOTH inference and detection: an overnight gap is not
@@ -179,7 +198,7 @@ class GapsWithinSession(ValidationRule):
         ).filter(~pl.col("is_session_boundary").fill_null(True))
 
         if analysed.height == 0:
-            return _pass(
+            return _skip(
                 "No intra-session intervals to analyse (one bar per session); skipped."
             )
 
@@ -188,7 +207,7 @@ class GapsWithinSession(ValidationRule):
             # Not a regular grid (tick/event data, or an ambiguous tie). Reporting
             # gaps here would mean flagging almost every interval, so the rule
             # declines to guess and says why.
-            return _pass(
+            return _skip(
                 "Could not infer a consistent bar frequency "
                 f"(most common spacing accounts for {confidence:.0%} of intervals, "
                 f"below the {dominance:.0%} required); skipped.",
@@ -219,8 +238,10 @@ class GapsWithinSession(ValidationRule):
         # Totals are computed over the FULL gap set, before details are capped, so
         # the summary stays accurate on heavily-holed data.
         missing_series = gaps.get_column("missing_bars")
-        total_missing = int(missing_series.sum())
-        largest_gap = int(missing_series.max())
+        # sum()/max() are typed as a broad scalar union; the column is integer by
+        # construction, so cast explicitly rather than leaving it implicit.
+        total_missing = int(cast("int", missing_series.sum()))
+        largest_gap = int(cast("int", missing_series.max()))
 
         capped = gaps.head(context.config.max_rows_in_details)
         violations = [
@@ -289,7 +310,7 @@ class OutsideTradingHours(ValidationRule):
                 rule_name=self.rule_name,
                 category=self.category,
                 severity=self.default_severity,
-                status=Status.PASS,
+                status=Status.SKIP,
                 message="No timestamp column present; skipped.",
             )
 
@@ -302,8 +323,8 @@ class OutsideTradingHours(ValidationRule):
                 rule_name=self.rule_name,
                 category=self.category,
                 severity=self.default_severity,
-                status=Status.PASS,
-                message="No data outside regular trading hours.",
+                status=Status.SKIP,
+                message="No rows to inspect; skipped.",
             )
 
         regular_open = context.calendar.regular_open()
