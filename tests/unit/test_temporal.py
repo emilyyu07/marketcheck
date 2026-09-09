@@ -29,9 +29,9 @@ ALL_TEMPORAL_RULES = [
 ]
 
 # Rules that are still stubs — used to assert NotImplementedError is raised.
-STUB_TEMPORAL_RULES = [
-    TimezoneInconsistency,
-]
+# Every temporal rule is implemented; an empty list keeps the contract test
+# in place for any future stub.
+STUB_TEMPORAL_RULES: list[type] = []
 
 
 def _df_for_dates(date_strs: list[str], hour: int = 10, minute: int = 0) -> pl.DataFrame:
@@ -890,3 +890,268 @@ class TestFormatFrequency:
 
         value = format_frequency(timedelta(minutes=4))
         assert json.dumps({"d": value}) == '{"d": "4min"}'
+
+
+# ---------------------------------------------------------------------------
+# TimezoneInconsistency
+# ---------------------------------------------------------------------------
+
+def _tz_dataset(
+    timestamps: list[datetime], source_timezone: str | None = "naive"
+) -> CanonicalDataset:
+    """Wrap timestamps in a CanonicalDataset carrying timezone provenance."""
+    df = pl.DataFrame(
+        {"timestamp": timestamps}, schema={"timestamp": pl.Datetime("us")}
+    )
+    return CanonicalDataset(
+        df=df,
+        source_path="test.csv",
+        row_count=len(timestamps),
+        source_timezone=source_timezone,
+    )
+
+
+def _session(start_hour: int, start_minute: int = 30, bars: int = 390) -> list[datetime]:
+    """`bars` one-minute timestamps beginning at the given time on 2024-01-02.
+
+    390 bars is a full NYSE session, so the default spans exactly 6.5 hours.
+    """
+    base = datetime(2024, 1, 2, start_hour, start_minute)
+    return [base + timedelta(minutes=i) for i in range(bars)]
+
+
+class TestTimezoneInconsistency:
+    """Tests for the TimezoneInconsistency validation rule."""
+
+    # --- PASS cases ---------------------------------------------------------
+
+    def test_pass_correct_et_session(self) -> None:
+        """A full 09:30-15:59 ET session is exactly what every rule assumes."""
+        result = TimezoneInconsistency().validate(
+            _tz_dataset(_session(9)), _make_context()
+        )
+
+        assert result.status == Status.PASS
+        assert result.rule_id == "temporal.timezone_inconsistency"
+        assert result.affected_rows == 0
+
+    def test_pass_declared_timezone_is_not_an_inconsistency(self) -> None:
+        """A source that declared a timezone consistently is NOT flagged: ingestion
+        converts it to ET wall-clock, so reading it was correct. Flagging it would
+        be a false positive on good data."""
+        result = TimezoneInconsistency().validate(
+            _tz_dataset(_session(9), source_timezone="UTC"), _make_context()
+        )
+
+        assert result.status == Status.PASS
+
+    def test_pass_extended_hours_data(self) -> None:
+        """04:00-20:00 spans 16 hours against a 6.5-hour session, so NO shift can
+        align it. Safe without special-casing — the alignment bar simply cannot be
+        met. OutsideTradingHours owns reporting these bars."""
+        result = TimezoneInconsistency().validate(
+            _tz_dataset(_session(4, 0, bars=960)), _make_context()
+        )
+
+        assert result.status == Status.PASS
+        assert "no uniform timezone shift" in result.message.lower()
+
+    def test_pass_partially_aligned_data_not_blamed_on_timezone(self) -> None:
+        """Data already mostly inside the session needs no explanation."""
+        result = TimezoneInconsistency().validate(
+            _tz_dataset(_session(10, 0, bars=300)), _make_context()
+        )
+
+        assert result.status == Status.PASS
+        assert "consistent with ET" in result.message
+
+    # --- SKIP cases ---------------------------------------------------------
+
+    def test_skip_timestamp_column_missing(self) -> None:
+        """MissingColumns owns absent columns."""
+        df = pl.DataFrame({"close": [1.0, 2.0]}, schema={"close": pl.Float64})
+        result = TimezoneInconsistency().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.SKIP
+
+    def test_skip_all_null_timestamps(self) -> None:
+        """NullValues owns nulls; nothing survives to infer from."""
+        df = pl.DataFrame(
+            {"timestamp": [None, None]}, schema={"timestamp": pl.Datetime("us")}
+        )
+        result = TimezoneInconsistency().validate(_make_dataset(df), _make_context())
+
+        assert result.status == Status.SKIP
+
+    def test_skip_daily_data_stamped_at_midnight(self) -> None:
+        """THE TRAP THIS RULE MUST NOT FALL INTO. Daily bars are commonly stamped
+        00:00, all outside the session, and a +10:00 shift would move them inside.
+        Without the distinct-times guard every daily dataset would be reported as
+        timezone-shifted at CRITICAL severity."""
+        daily = [datetime(2024, 1, d, 0, 0) for d in (2, 3, 4, 5, 8, 9, 10, 11, 12, 15)]
+        result = TimezoneInconsistency().validate(_tz_dataset(daily), _make_context())
+
+        assert result.status == Status.SKIP
+        assert "distinct time" in result.message
+
+    def test_skip_daily_data_stamped_at_close(self) -> None:
+        """Same guard, with daily bars stamped 16:00 instead of midnight."""
+        daily = [datetime(2024, 1, d, 16, 0) for d in (2, 3, 4, 5, 8, 9, 10, 11)]
+        result = TimezoneInconsistency().validate(_tz_dataset(daily), _make_context())
+
+        assert result.status == Status.SKIP
+
+    def test_skip_too_few_distinct_times_reports_the_count(self) -> None:
+        result = TimezoneInconsistency().validate(
+            _tz_dataset([datetime(2024, 1, 2, 0, 0)]), _make_context()
+        )
+
+        assert result.details["distinct_times_of_day"] == 1
+
+    # --- FAIL: metadata path -------------------------------------------------
+
+    def test_fail_mixed_aware_and_naive_source(self) -> None:
+        """The only unambiguously CRITICAL metadata case: rows that do not share a
+        frame of reference. Previously invisible — the unparseable rows became
+        nulls and only NullValues reported them, with no hint of the cause."""
+        result = TimezoneInconsistency().validate(
+            _tz_dataset(_session(9), source_timezone="mixed"), _make_context()
+        )
+
+        assert result.status == Status.FAIL
+        assert result.severity == Severity.CRITICAL
+        assert "mix" in result.message.lower()
+        assert "null" in result.message.lower()
+
+    def test_fail_mixed_source_reported_even_when_values_align(self) -> None:
+        """Mixed representations are an inconsistency regardless of how the
+        surviving values happen to look."""
+        result = TimezoneInconsistency().validate(
+            _tz_dataset(_session(9), source_timezone="mixed"), _make_context()
+        )
+
+        assert result.status == Status.FAIL
+        assert result.details["source_timezone"] == "mixed"
+
+    # --- FAIL: heuristic path ------------------------------------------------
+
+    def test_fail_utc_naive_session_detected(self) -> None:
+        """The common real-world case: a vendor ships UTC with no offset, so there
+        is no metadata to inspect. 09:30 ET becomes 14:30 naive."""
+        result = TimezoneInconsistency().validate(
+            _tz_dataset(_session(14)), _make_context()
+        )
+
+        assert result.status == Status.FAIL
+        assert result.details["suggested_shift"] == "-5:00"
+        assert result.details["suggested_shift_minutes"] == -300
+
+    def test_fail_reports_alignment_evidence(self) -> None:
+        """A CRITICAL finding must show its working."""
+        result = TimezoneInconsistency().validate(
+            _tz_dataset(_session(14)), _make_context()
+        )
+
+        assert result.details["current_alignment"] < 0.5
+        assert result.details["alignment_after_shift"] >= 0.9
+
+    def test_fail_half_hour_offset_detected(self) -> None:
+        """Half-hour zones exist and matter: a provider stamping India-local time
+        (+05:30) appears shifted from ET by -10:30. Whole-hour-only search would
+        miss this."""
+        result = TimezoneInconsistency().validate(
+            _tz_dataset(_session(20, 0)), _make_context()
+        )
+
+        assert result.status == Status.FAIL
+        assert result.details["suggested_shift"].endswith(":30")
+
+    def test_fail_affected_rows_is_every_row(self) -> None:
+        """A wrong timezone is a property of the column, not of individual bars, so
+        every row is affected — unlike every other rule, which counts offenders."""
+        timestamps = _session(14)
+        result = TimezoneInconsistency().validate(
+            _tz_dataset(timestamps), _make_context()
+        )
+
+        assert result.affected_rows == len(timestamps)
+
+    def test_fail_is_deterministic(self) -> None:
+        """Equal-scoring shifts must not resolve by iteration order. Repeated runs
+        on identical input must agree — the same class of defect as polars'
+        non-deterministic mode() tie ordering."""
+        timestamps = _session(14)
+        shifts = {
+            TimezoneInconsistency()
+            .validate(_tz_dataset(timestamps), _make_context())
+            .details["suggested_shift"]
+            for _ in range(10)
+        }
+
+        assert len(shifts) == 1
+
+    # --- Calibration is auditable --------------------------------------------
+
+    def test_calibration_constants_echoed_on_fail(self) -> None:
+        """The thresholds are not configurable, but hiding them would make a
+        CRITICAL finding unverifiable."""
+        result = TimezoneInconsistency().validate(
+            _tz_dataset(_session(14)), _make_context()
+        )
+
+        assert result.details["min_distinct_times_of_day"] == 10
+        assert result.details["min_alignment_after_shift"] == 0.90
+        assert result.details["max_current_alignment"] == 0.50
+
+    def test_calibration_constants_echoed_on_pass(self) -> None:
+        result = TimezoneInconsistency().validate(
+            _tz_dataset(_session(9)), _make_context()
+        )
+
+        assert "min_distinct_times_of_day" in result.details
+
+    # --- Message wording ------------------------------------------------------
+
+    def test_fail_message_states_the_consequence(self) -> None:
+        """CRITICAL is justified by scope: this does not invalidate one finding, it
+        invalidates every temporal rule. The message must say so."""
+        result = TimezoneInconsistency().validate(
+            _tz_dataset(_session(14)), _make_context()
+        )
+
+        lowered = result.message.lower()
+        assert "unreliable" in lowered
+        assert "et" in lowered
+
+    def test_fail_message_names_the_suggested_shift(self) -> None:
+        result = TimezoneInconsistency().validate(
+            _tz_dataset(_session(14)), _make_context()
+        )
+
+        assert "-5:00" in result.message
+
+
+class TestTimezoneAndTradingHoursTogether:
+    """DD19: both rules may fire. This one names the cause, the other the symptom."""
+
+    def test_both_rules_report_a_shifted_session(self) -> None:
+        dataset = _tz_dataset(_session(14))
+        tz_result = TimezoneInconsistency().validate(dataset, _make_context())
+        hours_result = OutsideTradingHours().validate(dataset, _make_context())
+
+        assert tz_result.status == Status.FAIL
+        assert hours_result.status == Status.WARN
+
+    def test_timezone_rule_is_the_more_severe_of_the_two(self) -> None:
+        """The cause outranks the symptom: a wrong timezone makes the data unusable,
+        while bars outside hours are merely noteworthy."""
+        dataset = _tz_dataset(_session(14))
+
+        assert (
+            TimezoneInconsistency().validate(dataset, _make_context()).severity
+            == Severity.CRITICAL
+        )
+        assert (
+            OutsideTradingHours().validate(dataset, _make_context()).severity
+            == Severity.INFO
+        )

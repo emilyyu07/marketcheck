@@ -79,9 +79,20 @@ class TestCliOutput:
         assert output_file.exists()
         assert output_file.read_text()
 
-    def test_skipped_rules_are_reported(self, sample_csv_path: Path) -> None:
-        """Skips must be visible in the report rather than folded into passes."""
-        result = runner.invoke(app, [str(sample_csv_path), "--format", "json"])
+    def test_skipped_rules_are_reported(self, tmp_path: Path) -> None:
+        """Skips must be visible in the report rather than folded into passes.
+
+        Uses a file with no `volume` column so a rule genuinely cannot evaluate.
+        A fully clean file now produces no skips at all, since every rule is
+        implemented."""
+        path = tmp_path / "novolume.csv"
+        path.write_text(
+            "timestamp,open,high,low,close\n"
+            "2024-01-02 09:30:00,100,101,99,100\n"
+            "2024-01-02 09:31:00,100,101,99,100\n",
+            encoding="utf-8",
+        )
+        result = runner.invoke(app, [str(path), "--format", "json"])
         data = json.loads(result.stdout)
 
         assert data["total_skipped"] > 0

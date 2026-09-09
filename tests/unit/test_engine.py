@@ -53,6 +53,33 @@ def broken_rule() -> Iterator[type[ValidationRule]]:
         REGISTRY.remove(DeliberatelyBrokenRule)
 
 
+@pytest.fixture
+def unimplemented_rule() -> Iterator[type[ValidationRule]]:
+    """Temporarily register a rule that raises NotImplementedError.
+
+    Every real rule is now implemented, so the runner's stub-handling path needs a
+    synthetic rule to exercise it. Keeping the test means the guarantee survives
+    if a stub is ever added again.
+    """
+
+    class NotYetImplementedRule(ValidationRule):
+        rule_id = "test.unimplemented"
+        rule_name = "Not Yet Implemented Rule"
+        category = Category.TEMPORAL
+        default_severity = Severity.CRITICAL
+
+        def validate(
+            self, dataset: CanonicalDataset, context: RuleContext
+        ) -> ValidationResult:
+            raise NotImplementedError("TODO: implement test.unimplemented")
+
+    REGISTRY.append(NotYetImplementedRule)
+    try:
+        yield NotYetImplementedRule
+    finally:
+        REGISTRY.remove(NotYetImplementedRule)
+
+
 class TestRunner:
     def test_runs_one_rule_per_registered_rule(self, sample_ohlcv_df: pl.DataFrame) -> None:
         dataset = to_canonical(sample_ohlcv_df, source_path="test.csv")
@@ -62,17 +89,17 @@ class TestRunner:
         assert len({r.rule_id for r in results}) == len(results)
 
     def test_unimplemented_rule_is_skipped_not_passed(
-        self, sample_ohlcv_df: pl.DataFrame
+        self, sample_ohlcv_df: pl.DataFrame, unimplemented_rule: type[ValidationRule]
     ) -> None:
         """A stub must never be reported as a pass — that would claim an
-        unimplemented check had verified the data."""
+        unimplemented check had verified the data. All 14 real rules are now
+        implemented, so this uses a synthetic stub to keep the guarantee tested."""
         dataset = to_canonical(sample_ohlcv_df, source_path="test.csv")
         results = run_validation(dataset)
 
-        stubs = [r for r in results if "not yet implemented" in r.message]
-        assert stubs, "expected at least one unimplemented rule"
-        for stub in stubs:
-            assert stub.status == Status.SKIP
+        stub = next(r for r in results if r.rule_id == "test.unimplemented")
+        assert stub.status == Status.SKIP
+        assert "not yet implemented" in stub.message
 
     def test_clean_data_produces_no_failures(self, sample_ohlcv_df: pl.DataFrame) -> None:
         """The shared fixture is deliberately clean, so no rule should fail on it."""
@@ -175,9 +202,12 @@ class TestAggregatorCounts:
     def test_skipped_count_is_no_longer_hardcoded_zero(
         self, sample_ohlcv_df: pl.DataFrame
     ) -> None:
-        """Regression guard: total_skipped was previously hardcoded to 0 while
-        unimplemented rules were reported as passes."""
-        dataset = to_canonical(sample_ohlcv_df, source_path="test.csv")
+        """Regression guard: total_skipped was previously hardcoded to 0.
+
+        Uses a dataset with no `volume` column so at least one rule genuinely
+        skips. It deliberately does not rely on an unimplemented rule, since every
+        rule is now implemented and a clean file produces no skips at all."""
+        dataset = to_canonical(sample_ohlcv_df.drop("volume"), source_path="test.csv")
         summary = aggregate(run_validation(dataset), dataset)
 
         assert summary.total_skipped > 0
