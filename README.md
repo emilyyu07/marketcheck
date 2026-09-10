@@ -217,7 +217,7 @@ Knowing a tool's blind spots is part of trusting it.
 
 ```bash
 uv sync
-pytest              # 444 passed, 3 skipped
+pytest              # 443 passed
 ruff check .
 mypy src            # strict
 ```

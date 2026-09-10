@@ -29,10 +29,6 @@ ALL_STRUCTURAL_RULES = [
     NullValues,
 ]
 
-# Rules that are still stubs — used to assert NotImplementedError is raised.
-STUB_STRUCTURAL_RULES: list[type] = []
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -66,13 +62,6 @@ class TestStructuralRulesRegistered:
         """Every structural rule must declare Category.STRUCTURAL."""
         rule = rule_cls()
         assert rule.category == Category.STRUCTURAL
-
-    @pytest.mark.parametrize("rule_cls", STUB_STRUCTURAL_RULES)
-    def test_stub_rules_raise_not_implemented(self, rule_cls: type) -> None:
-        """Rules not yet implemented must raise NotImplementedError."""
-        rule = rule_cls()
-        with pytest.raises(NotImplementedError):
-            rule.validate(None, None)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------

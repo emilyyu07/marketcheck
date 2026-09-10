@@ -28,12 +28,6 @@ ALL_TEMPORAL_RULES = [
     TimezoneInconsistency,
 ]
 
-# Rules that are still stubs — used to assert NotImplementedError is raised.
-# Every temporal rule is implemented; an empty list keeps the contract test
-# in place for any future stub.
-STUB_TEMPORAL_RULES: list[type] = []
-
-
 def _df_for_dates(date_strs: list[str], hour: int = 10, minute: int = 0) -> pl.DataFrame:
     """Build a timestamp-only DataFrame with one row per given date (YYYY-MM-DD).
 
@@ -79,13 +73,6 @@ class TestTemporalRulesRegistered:
         """Every temporal rule must declare Category.TEMPORAL."""
         rule = rule_cls()
         assert rule.category == Category.TEMPORAL
-
-    @pytest.mark.parametrize("rule_cls", STUB_TEMPORAL_RULES)
-    def test_stub_rules_raise_not_implemented(self, rule_cls: type) -> None:
-        """Rules not yet implemented must raise NotImplementedError."""
-        rule = rule_cls()
-        with pytest.raises(NotImplementedError):
-            rule.validate(None, None)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------

@@ -36,9 +36,6 @@ class CanonicalDataset(BaseModel):
     end_time: datetime | None = None
     """Latest timestamp in the dataset."""
 
-    inferred_frequency: str = ""
-    """Inferred bar frequency (e.g. '1min', '5min', '1d')."""
-
     source_timezone: str | None = None
     """What timezone information the SOURCE timestamps carried, before coercion.
 

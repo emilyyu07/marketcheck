@@ -403,12 +403,13 @@ Two independent detections, covering disjoint failure modes:
 Key notes:
 - consistent timezone declarations are not flagged
 - shifts searched in 30-minute increments
-- reported shift is difference from ET, not source's UTC offset (e.g. India +05:30 appears as +10:30)
+- reported shift is the difference from ET, not the source's UTC offset
+  (e.g. India +05:30 appears as +10:30)
 - OutsideTradingHours will usually also fire when the heuristic does. Both are
-  allowed to report: this rule names the cause, other details the symptoms
+  allowed to report: this rule names the cause, the other names the symptom
 
 '''
-# --- Heuristic calibration (constants) -------------------------------------------------------------
+# --- Heuristic calibration (constants) ---------------------------------------
 # Minimum distinct times-of-day before a shift is even considered. Daily data has
 # exactly one, which is what makes the daily-data trap avoidable.
 _MIN_DISTINCT_TIMES = 10

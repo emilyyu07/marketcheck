@@ -27,10 +27,6 @@ ALL_NUMERICAL_RULES = [
     ImpossibleValues,
 ]
 
-# Rules that are still stubs — used to assert NotImplementedError is raised.
-STUB_NUMERICAL_RULES: list[type] = []
-
-
 def _price_df(
     closes: list[float | None], dates: list[str] | None = None
 ) -> pl.DataFrame:
@@ -110,13 +106,6 @@ class TestNumericalRulesRegistered:
         """Every numerical rule must declare Category.NUMERICAL."""
         rule = rule_cls()
         assert rule.category == Category.NUMERICAL
-
-    @pytest.mark.parametrize("rule_cls", STUB_NUMERICAL_RULES)
-    def test_stub_rules_raise_not_implemented(self, rule_cls: type) -> None:
-        """Rules not yet implemented must raise NotImplementedError."""
-        rule = rule_cls()
-        with pytest.raises(NotImplementedError):
-            rule.validate(None, None)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------

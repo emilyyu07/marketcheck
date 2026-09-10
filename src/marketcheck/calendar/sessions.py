@@ -6,7 +6,7 @@ Provides NYSE market awareness (i.e. valid trading days, open/close times) to va
 
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import date, time
 
 import pandas_market_calendars as mcal
 
@@ -33,26 +33,6 @@ class MarketCalendar:
         """
         schedule = self._calendar.schedule(start_date=str(start), end_date=str(end))
         return [d.date() for d in schedule.index]
-
-    def session_hours(self, session_date: date | str) -> tuple[datetime, datetime]:
-        """Return market open and close times for a given trading date.
-
-        Args:
-            session_date: The trading date.
-
-        Returns:
-            Tuple of (market_open, market_close) as timezone-aware datetimes.
-
-        Raises:
-            ValueError: If the date is not a valid trading session.
-        """
-        schedule = self._calendar.schedule(
-            start_date=str(session_date), end_date=str(session_date)
-        )
-        if schedule.empty:
-            raise ValueError(f"{session_date} is not a valid trading session")
-        row = schedule.iloc[0]
-        return (row["market_open"].to_pydatetime(), row["market_close"].to_pydatetime())
 
     def is_trading_day(self, d: date | str) -> bool:
         """Check whether a date is a valid trading session."""
