@@ -205,9 +205,11 @@ Knowing a tool's blind spots is part of trusting it.
 - **Gaps must be the minority.** Bar frequency is the most common spacing, so data missing more than
   half its bars will have the *gap* spacing mistaken for the real grid.
 - **No tick data.** Rules assume a fixed bar grid; irregular data is skipped, not flagged.
-- **Timezone checking needs intraday data.** Daily bars are typically stamped `00:00`, where a
-  whole-hour shift would move them into the session — a real zone error is indistinguishable from
-  the data simply being daily, so the rule skips.
+- **Timezone checking needs 30-minute bars or finer.** The check requires 10+ distinct times of
+  day, so it runs on 1min–30min data and skips on hourly and daily. With few distinct times a
+  uniform shift is indistinguishable from the data simply being coarse — daily bars stamped
+  `00:00` would be "fixed" into the session by a `+10:00` shift, so guessing would flag every
+  daily file as critically broken.
 - **A declared offset is visible, but not which one.** Timestamps are normalised on read, so the
   tool knows a source carried a timezone, not that it said `-05:00` specifically.
 
