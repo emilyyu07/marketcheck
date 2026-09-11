@@ -76,6 +76,17 @@ thresholds used, so any finding can be audited.
 | `--strict` | Treat warnings as failures (affects exit code only) |
 | `--output`, `-o` | Write the report to a file instead of stdout |
 | `--config`, `-c` | Path to a TOML config file |
+| `--color` | `auto` (default), `always`, or `never` |
+
+### Colour
+
+`auto` colours only an interactive terminal — a report piped into another tool or written with
+`--output` stays plain, because escape codes in a durable artifact are noise. `always` forces
+colour through a pipe and into `--output`; `never` disables it. `NO_COLOR` suppresses `auto` but
+not an explicit `always`, and JSON is never colourised.
+
+Colour is purely additive: stripping the escape codes reproduces the plain report byte for byte.
+`skip` is dimmed rather than tinted, since giving it a hue would imply a verdict was reached.
 
 ## Exit codes
 
@@ -217,7 +228,7 @@ Knowing a tool's blind spots is part of trusting it.
 
 ```bash
 uv sync
-pytest              # 443 passed
+pytest              # 461 passed
 ruff check .
 mypy src            # strict
 ```
