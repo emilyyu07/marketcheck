@@ -39,7 +39,7 @@ src/marketcheck/
 │                   EXPECTED_DTYPES, coerce_dtypes), canonicalize.py (to_canonical)
 ├── models/         enums.py (Severity/Status/Category), dataset.py (CanonicalDataset),
 │                   result.py (ValidationResult, DatasetSummary), config.py (ValidationConfig)
-├── calendar/       sessions.py (MarketCalendar wrapper), timezones.py — implemented;
+├── calendar/       sessions.py (MarketCalendar wrapper) — implemented;
 │                   MarketCalendar reaches rules via RuleContext.calendar
 ├── validators/     base.py (ABC/REGISTRY/register — done)
 │                   structural.py (5 rules, 5 done) | temporal.py (4, 2 done)
@@ -53,7 +53,7 @@ src/marketcheck/
 
 > Rule count grew 13 -> 14: `numerical.non_positive_prices` was added as a
 > deliberate scope split out of `OhlcRangeViolation` (see Numerical section).
-> Implemented: 13 of 14 (structural 5/5, temporal 3/4, numerical 4/4, financial 1/1).
+> Implemented: **14 of 14** (structural 5/5, temporal 4/4, numerical 4/4, financial 1/1). ✅
 
 ### Structural (`validators/structural.py`) — 5 of 5 implemented
 | # | rule_id | Class | Status |
@@ -138,13 +138,13 @@ src/marketcheck/
 - **Known limitation (not fixed, documented via test + this note)**: `coerce_dtypes()` casts numeric columns with `.cast(dtype, strict=False)`, so a value that fails to parse (e.g. a non-numeric string in a numeric column) is silently converted to `null` during ingestion. By the time `NullValues` runs, a genuinely-absent source value and a genuinely-corrupt-but-unparseable source value are indistinguishable — both just look like `null`. Fixing this is out of scope for this rule (it would mean changing `coerce_dtypes`, which affects every rule downstream, not just this one). Test `test_warn_unparseable_source_value_reported_as_null` documents this behavior explicitly so it's intentional, not an accidental blind spot.
 - **Cross-rule interaction worth being aware of (not tested here, flagged only)**: an entirely-null column's effect on `InvalidDtypes`'s dtype check wasn't verified — if a fully-null column caused Polars to report an ambiguous/`Null` dtype instead of the coerced type, that would be an `InvalidDtypes` gap, not a `NullValues` bug. Worth checking if `InvalidDtypes` is revisited.
 
-### Temporal (`validators/temporal.py`) — 3 of 4 implemented
+### Temporal (`validators/temporal.py`) — 4 of 4 implemented ✅
 | rule_id | Class | Status |
 |---|---|---|
 | `temporal.outside_trading_hours` | `OutsideTradingHours` | ✅ Implemented + fully tested |
 | `temporal.missing_sessions` | `MissingSessions` | ✅ Implemented + fully tested |
 | `temporal.gaps_within_session` | `GapsWithinSession` | ✅ Implemented + fully tested |
-| `temporal.timezone_inconsistency` | `TimezoneInconsistency` | ⬜ Stub — **deliberately deferred**, see below |
+| `temporal.timezone_inconsistency` | `TimezoneInconsistency` | ✅ Implemented + fully tested |
 
 **Infrastructure added with this rule — `MarketCalendar` now threaded via `RuleContext`.**
 `RuleContext` (`validators/base.py`) gained a `calendar: MarketCalendar` field, defaulted
@@ -187,9 +187,12 @@ extension point being exercised for the first time, not a new architectural deci
   objects. So this is a **naive-to-naive comparison with no tz conversion at all**. That
   works because this pipeline assumes naive timestamps already represent **ET wall-clock
   time** — the data provider's contract, which this rule *uses* but does not *verify*.
-  (Verifying it is exactly what `TimezoneInconsistency` would do, and exactly why that
-  rule is currently blocked — see its deferral note below.) If that assumption is ever
-  revisited, this rule's comparison logic must be revisited with it.
+  Verifying that assumption is exactly what `TimezoneInconsistency` now does, so the two
+  rules are complementary: this one *uses* the ET contract, that one *checks* it. The
+  assumption is now also enforced upstream — `coerce_dtypes()` converts a timezone-aware
+  source to ET wall-clock before stripping the zone, so a file declaring `-05:00` no longer
+  arrives here shifted (see the ingestion note below). The canonical dtype is still naive, so
+  this rule's naive-to-naive comparison remains correct and unchanged.
 - Guard clauses: missing `timestamp` column → PASS/skip (`MissingColumns` owns absence);
   `df.height == 0` → PASS. Note this uses `== 0`, **not** the `< 2` guard used by
   `UnsortedTimestamps`/`DuplicateTimestamps` — those do pairwise/cross-row reasoning that's
@@ -513,64 +516,104 @@ columns (it ignores them, so `MissingColumns` retains ownership), and unparseabl
 `test_warn_unparseable_source_value_reported_as_null`, not a regression from making
 `coerce_dtypes()` tolerant.
 
-**`TimezoneInconsistency` — deliberately deferred, not just "not yet gotten to."**
-Investigated first (before `OutsideTradingHours`) since it looked like the
-lowest-dependency temporal rule (no `MarketCalendar` needed). That
-investigation surfaced a real blocker worth recording so it isn't
-re-discovered from scratch later:
+`TimezoneInconsistency` design decisions — README-relevant:
 
-- `ingestion/schema.py`'s `coerce_dtypes()` casts the `timestamp` column to
-  `pl.Datetime("us")` — **no timezone** — via `.cast(dtype, strict=False)`,
-  unconditionally, for every dataset. Polars columns have exactly one dtype;
-  a single `Series` can never hold a per-row mix of naive/aware timestamps.
-  So whatever timezone information existed in the source file (mixed
-  offsets, mixed naive/aware rows, etc.) is **silently discarded during
-  ingestion**, before any validator — including this one — ever sees the
-  data. By the time `TimezoneInconsistency.validate()` would run, there is
-  nothing left to detect: the inconsistency (if any existed) already
-  happened upstream and left no trace in `CanonicalDataset`.
-- Two options were identified:
-  - **Option A (real fix, deferred)**: change ingestion to preserve
-    pre-coercion timestamp representation (e.g. load `timestamp` as raw
-    strings instead of using `load_csv`'s `try_parse_dates=True`, thread a
-    raw/pre-cast column or parse-diagnostics side-channel through
-    `CanonicalDataset`) so the rule can detect genuine mixed naive/aware or
-    mixed-offset rows. This is the only option that makes "inconsistency"
-    mean what the rule name implies. **Explicitly out of scope for now** —
-    it touches `ingestion/loaders.py`, `ingestion/schema.py`,
-    `models/dataset.py`, and `ingestion/canonicalize.py`, i.e. exactly the
-    "ingestion, ~~not just validators~~" blast radius this codebase's
-    architecture is designed to avoid for a single rule, and it changes
-    pipeline behavior for every dataset, not just this rule's concern.
-  - **Option C (rejected for now)**: keep ingestion as-is and scope the rule
-    down to column-level tz metadata (naive-vs-aware dtype check, which is
-    always trivially true given current coercion and therefore nearly
-    useless) or a wall-clock-plausibility heuristic (which conceptually
-    overlaps with `OutsideTradingHours`'s territory — both would be
-    reasoning about "does this wall-clock hour make sense," a division of
-    labor that would need to be defined explicitly, the same way
-    `UnsortedTimestamps`/`DuplicateTimestamps` divided ownership of ties).
-- **Decision: defer this rule entirely** rather than ship Option C's
-  narrowed/overlapping version. `OutsideTradingHours` was implemented
-  instead (its design notes are above). Note that Option C's overlap concern
-  is now concrete rather than hypothetical: `OutsideTradingHours` has since
-  claimed time-of-day plausibility as its own scope, so a future
-  `TimezoneInconsistency` must **not** re-derive "is this wall-clock hour
-  sensible" — it needs to detect genuine source-level tz representation
-  disagreement (Option A), which is a different question and doesn't
-  collide. Revisit when ready to take on Option A's ingestion change as its
-  own deliberate piece of work — read this note first before restarting that
-  design, so the blocker isn't rediscovered from scratch.
-- Worth noting for whoever picks up Option A: `OutsideTradingHours` now
-  *depends* on the "naive timestamps are ET wall-clock" assumption (see its
-  notes above). Option A would make that assumption verifiable rather than
-  merely assumed, so the two rules are complementary — but if Option A ever
-  changes the canonical `timestamp` dtype to be tz-*aware*,
-  `OutsideTradingHours`'s naive-to-naive comparison against
-  `regular_open()`/`regular_close()` would need updating in lockstep.
+**The blocker was real, and resolving it uncovered an active data-corruption bug.**
+`coerce_dtypes()` cast `timestamp` to naive `pl.Datetime("us")` unconditionally. polars
+normalises offsets to UTC on read, so a **correct** bar written as `09:30:00-05:00` arrived at
+the validators as a naive `14:30`. Measured on a valid 390-bar NYSE session: **300 bars were
+reported "outside regular trading hours."** The data was right; MarketCheck shifted it five
+hours and then blamed the data. This affected any file carrying an explicit offset, which is
+common in real vendor feeds.
 
-`temporal.missing_sessions` (`MissingSessions`) and `temporal.gaps_within_session`
-(`GapsWithinSession`) remain stubs, not yet investigated in detail.
+**Ingestion fix (the "Option A" change, now done).** `coerce_dtypes()` converts a
+timezone-aware column to **ET wall-clock** and *then* strips the zone, rather than casting
+straight to naive. Reading a declared offset correctly is not repairing data; discarding it is
+misreading. Every existing rule keeps working unchanged because the canonical dtype is still
+naive — only its *meaning* is now guaranteed to be ET. The false positives went from 300 to 0.
+DST is handled by converting through a real timezone rather than a fixed offset, so July data
+(ET = -04:00) resolves correctly too.
+
+**Provenance recorded, not inferred.** `CanonicalDataset.source_timezone` captures what the
+source declared, populated by `describe_timestamp_timezone()` **before** coercion, since
+coercion makes the original representation unrecoverable. This is the first rule that depends
+on ingestion having recorded something — the opposite of the `frequency.py` decision — and was
+chosen deliberately because, unlike bar frequency, timezone provenance is *destroyed* by
+normalisation and cannot be recovered later by any amount of inspection.
+
+**Two independent detections, covering disjoint failure modes:**
+1. **Metadata** — `source_timezone == "mixed"` means the column held both offset-bearing and
+   offset-free values, which cannot be parsed as one type, so those rows silently became
+   nulls. Previously invisible: the user saw only "some nulls" from `NullValues` with no hint
+   that timezone formatting was the cause.
+2. **Heuristic** — naive timestamps that do not look like ET at all. This is the case with *no*
+   metadata to inspect, and it is the common one: many vendors ship UTC with no offset. If
+   bars align poorly with the session but one uniform shift would align them well, the file is
+   in another zone.
+
+**Deliberately NOT flagged:** a consistently-declared timezone. Ingestion now reads it
+correctly, so there is no inconsistency, and flagging it would be a false positive on good
+data. This is why the rule stays `CRITICAL` yet fires narrowly.
+
+**The daily-data trap, which the obvious implementation falls into.** Daily bars are commonly
+stamped `00:00`, all outside the session, and a `+10:00` shift would move them inside — so a
+naive heuristic reports *every daily dataset* as timezone-shifted at CRITICAL severity. The
+guard is to require ≥10 distinct times-of-day: with one, a zone shift is mathematically
+indistinguishable from the data simply being daily, so the rule skips.
+
+**Extended-hours data is safe for free.** A 04:00–20:00 file spans 16 hours against a 6.5-hour
+session, so no shift can place 90% of its bars inside and the alignment bar cannot be met. No
+special-casing needed — the same kind of self-solving property that made half sessions a
+non-issue for `MissingSessions` and daily data self-skip in `GapsWithinSession`.
+
+**Calibration as module constants, not config** (`_MIN_DISTINCT_TIMES=10`,
+`_MIN_SHIFTED_ALIGNMENT=0.90`, `_MAX_CURRENT_ALIGNMENT=0.50`). Unlike
+`volume_anomaly_multiplier`, these are not policy or vendor properties — they are the evidence
+bar for an inference, and a wrong value produces *confident CRITICAL findings on good data*.
+Reversibility is asymmetric: promoting a constant to config later is backward-compatible,
+whereas removing a documented config key is a breaking change. They are echoed into `details`
+so a CRITICAL finding stays auditable, matching `split_ratio_tolerance` and
+`frequency_confidence`.
+
+**Shifts searched in 30-minute steps** across ±12/+14h, covering whole-hour zones and the real
+half-hour ones (India `+05:30`, Newfoundland `-03:30`, ACST `+09:30`). 45-minute zones (Nepal,
+Chatham, Eucla) are deliberately excluded as implausible for US equity data; every extra
+candidate widens the false-positive surface. Ties resolve to the smaller absolute shift, which
+keeps the result deterministic — the same defect class as polars' non-deterministic `mode()`
+tie ordering caught in `frequency.py`. The reported shift is the difference *from ET*, not the
+source's UTC offset: India-stamped data appears shifted by `-10:30`.
+
+**`affected_rows` is the full row count**, uniquely among the rules. A wrong timezone is a
+property of the column, not of individual bars, so every row is affected.
+
+**Overlap with `OutsideTradingHours` is allowed** (both fire on a shifted session): this rule
+names the *cause* at `CRITICAL`, that one names the *symptom* at `INFO`. Suppressing one would
+need cross-rule state, which the architecture deliberately avoids.
+
+**Known limitation:** polars normalises offsets to UTC on read, so a declared offset is visible
+as "aware" but the specific offset is not recoverable.
+
+### Timestamp parsing was destructive, and the obvious fix was worse
+
+Found while testing the above. `coerce_dtypes()` used `.cast(pl.Datetime, strict=False)` on an
+unparsed timestamp column. That is deprecated (removed in polars 2.0) and **destructive**:
+given `["2024-01-02 09:30:00", "not-a-date"]` it returned `[None, None]`, nulling the *valid*
+row. A single malformed timestamp erased every timestamp in the file.
+
+Replacing it with an expression-based `str.to_datetime` traded data loss for **crashes** —
+polars refuses format inference inside an expression when a timezone appears in the data,
+raising `ComputeError` on any offset-bearing string column and costing the user their whole
+report. The working form runs the parse **eagerly on the Series** (which the polars error
+message itself suggests), with a null-column fallback for wholly unparseable input: nulling
+still lets `MissingColumns`, `NullValues`, and `timezone_inconsistency` report, whereas an
+exception denies the user any report at all. Verified across six input shapes: never raises,
+never nulls a parseable row.
+
+**Provenance accuracy matters because `mixed` drives a CRITICAL finding.** Only *date-like*
+values participate in the naive-vs-aware comparison. Without that filter,
+`["2024-01-02T09:30:00-05:00", "garbage"]` looked like an aware/naive mixture and would have
+been reported as a CRITICAL timezone inconsistency, when the real problem is one unparseable
+value and nothing to do with timezones.
 
 ### Numerical (`validators/numerical.py`) — 4 of 4 implemented ✅
 | rule_id | Class | Status |
@@ -781,7 +824,7 @@ one" reasoning this document already floated for a possible
 
 ## Test status
 
-`pytest` → **392 passed, 2 skipped, 0 failed** (last run confirmed this session). The
+`pytest` → **443 passed, 0 skipped, 0 failed** (last run confirmed this session). The
 1 skip is `TestStructuralRulesRegistered::test_stub_rules_raise_not_implemented`,
 which is parametrized over `STUB_STRUCTURAL_RULES` — now empty since all 5
 structural rules are implemented, so pytest emits a harmless empty-parametrization
@@ -836,7 +879,8 @@ Conventions observed:
 4. ~~`SuspiciousPriceJump`~~ — ✅ **done** (rule 14 `ImpossibleValues` also done, slotted in here)
 5. ~~`CorporateActionDiscontinuity`~~ — ✅ **done** (paired half of the gap-detection split)
 6. ~~`GapsWithinSession`~~ — ✅ **done** (frequency inference solved via `validators/frequency.py`)
-7. **`TimezoneInconsistency`** ← last rule — blocked on the ingestion tz change (Option A)
+7. ~~`TimezoneInconsistency`~~ — ✅ **done**, together with the Option A ingestion change.
+   **All 14 rules implemented.**
 5. `CorporateActionDiscontinuity`
 6. `GapsWithinSession`
 7. `TimezoneInconsistency`
@@ -915,7 +959,50 @@ consistent as new rules are added.
 
 ```bash
 uv sync                                  # install deps
-pytest                                   # run tests (392 passing, 2 skipped baseline)
+pytest                                   # run tests (443 passing baseline)
 ruff check .                             # lint
 marketcheck validate <file> --format json
 ```
+
+## Scaffolding cleanup
+
+A dead-code sweep (AST symbol extraction cross-referenced against all usage in
+`src` and `tests`) removed scaffolding that had never been filled in, plus code
+that later work had made redundant:
+
+- **`calendar/timezones.py` (whole module)** — `localize_to_et()` and
+  `normalize_to_utc()` were never imported by anything. They were superseded by
+  `coerce_dtypes()`, which now performs the aware-to-ET conversion inline during
+  ingestion. Keeping them would have implied two competing timezone paths.
+- **`MarketCalendar.session_hours()`** — unreferenced by any rule or test. Rules
+  use `valid_sessions()` plus the static `regular_open()`/`regular_close()`; per-day
+  open/close lookup was never needed. (Note this means half-session *closes* are
+  not consulted anywhere, which is consistent with `MissingSessions` only checking
+  session presence.)
+- **`CanonicalDataset.inferred_frequency`** — a field that was always `""`. Never
+  assigned by ingestion and never read. Its presence advertised a capability the
+  pipeline does not have; frequency inference is done on demand in
+  `validators/frequency.py`, which is where the two rules that need it call from.
+- **`benchmarks/generate_synthetic.py`** and **`demo/inject_faults.py`** — argparse
+  shells whose bodies were `print("TODO: ...")`.
+- **`tests/perf/test_benchmarks.py`** — a single `assert True`, which is worse than
+  no test: it reports a passing performance suite that measures nothing.
+- **`tests/fixtures/.gitkeep`** — placeholder for a directory never used; tests build
+  frames inline or via `tmp_path`.
+- **`STUB_*_RULES` lists in the three rule test modules** — retained after the last
+  stub was implemented "for any future stub", but an empty `parametrize` list makes
+  pytest emit a *skip*, so the suite carried 3 permanent skips implying unfinished
+  work. Same principle the `Status.SKIP` work established: a report should not
+  suggest something was left unverified when nothing was.
+
+Result: 443 passed / **0 skipped**, `ruff` clean, `mypy --strict` clean over 29
+source files, and no unreferenced symbol remaining in `src`.
+
+One lesson worth recording: the first attempt at the `STUB_*` removal used a
+regex to match the parametrized test, and it over-matched — swallowing the
+following section-header comment *and* the next `class` statement, which silently
+re-parented three test classes into the class above them. The suite still passed
+(the methods ran, just under the wrong class), so green tests did not catch it;
+only a diff review and a top-level `class` count did. Structural edits to Python
+should be line-anchored and verified by counting the structures they must not
+touch, not by regex over source text.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 
 import pytest
@@ -239,3 +240,66 @@ class TestRenderJson:
         )
 
         assert data["results"] == []
+
+
+class TestRenderTextColor:
+    """Colour must be purely additive: it may add escape codes and nothing else."""
+
+    ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+    def test_no_color_by_default(self) -> None:
+        """The default rendering stays a plain, durable artifact."""
+        assert "\x1b[" not in render_text(_summary(results=[_result(Status.FAIL)]))
+
+    def test_color_false_is_explicitly_plain(self) -> None:
+        summary = _summary(results=[_result(Status.WARN)])
+        assert "\x1b[" not in render_text(summary, color=False)
+
+    def test_color_true_emits_escape_codes(self) -> None:
+        summary = _summary(results=[_result(Status.FAIL)])
+        assert "\x1b[" in render_text(summary, color=True)
+
+    def test_stripping_color_reproduces_plain_output(self) -> None:
+        """The invariant that guarantees colour cannot corrupt layout."""
+        summary = _summary(
+            overall_status=Status.FAIL,
+            results=[
+                _result(Status.PASS, rule_id="a.p"),
+                _result(Status.WARN, rule_id="b.w", affected_rows=3),
+                _result(Status.FAIL, rule_id="c.f"),
+                _result(Status.SKIP, rule_id="d.s"),
+            ],
+        )
+        coloured = render_text(summary, color=True)
+        assert self.ANSI.sub("", coloured) == render_text(summary, color=False)
+
+    @pytest.mark.parametrize(
+        ("status", "code"),
+        [
+            (Status.PASS, "\x1b[32m"),  # green
+            (Status.WARN, "\x1b[33m"),  # yellow
+            (Status.FAIL, "\x1b[31m"),  # red
+            (Status.SKIP, "\x1b[2m"),   # dim, deliberately no hue
+        ],
+    )
+    def test_each_status_gets_its_colour(self, status: Status, code: str) -> None:
+        out = render_text(_summary(results=[_result(status)]), color=True)
+        assert code in out
+
+    def test_skip_is_never_given_a_hue(self) -> None:
+        """A coloured skip would imply a verdict; SKIP means no verdict was reached."""
+        out = render_text(
+            _summary(overall_status=Status.SKIP, results=[_result(Status.SKIP)]),
+            color=True,
+        )
+        for hue in ("\x1b[32m", "\x1b[33m", "\x1b[31m"):
+            assert hue not in out
+
+    def test_alignment_is_unaffected_by_colour(self) -> None:
+        """Padding is applied before painting, so columns still line up."""
+        summary = _summary(
+            results=[_result(Status.PASS, rule_id="a.p"), _result(Status.FAIL, rule_id="b.f")]
+        )
+        plain = render_text(summary, color=False).splitlines()
+        stripped = [self.ANSI.sub("", ln) for ln in render_text(summary, color=True).splitlines()]
+        assert plain == stripped

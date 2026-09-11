@@ -255,3 +255,61 @@ class TestCliConfigFile:
 
         assert result.exit_code == EXIT_OK
         assert json.loads(result.stdout)["overall_status"] == "pass"
+
+
+class TestCliColor:
+    """`--color` controls escape codes; an unknown value is a tool error."""
+
+    def test_invalid_color_value_is_rejected(self, tmp_path: Path) -> None:
+        """A silently ignored flag would misrepresent what the user configured."""
+        result = runner.invoke(app, [str(_clean_csv(tmp_path)), "--color", "pink"])
+        assert result.exit_code == EXIT_TOOL_ERROR
+        assert "invalid --color value" in result.output
+
+    def test_color_never_is_plain(self, tmp_path: Path) -> None:
+        result = runner.invoke(app, [str(_clean_csv(tmp_path)), "--color", "never"])
+        assert result.exit_code == EXIT_OK
+        assert "\x1b[" not in result.output
+
+    def test_color_always_emits_codes_even_when_not_a_tty(self, tmp_path: Path) -> None:
+        """CliRunner captures a pipe, so this proves the forced path works."""
+        result = runner.invoke(app, [str(_clean_csv(tmp_path)), "--color", "always"], color=True)
+        assert result.exit_code == EXIT_OK
+        assert "\x1b[" in result.output
+
+    def test_auto_is_plain_when_not_a_tty(self, tmp_path: Path) -> None:
+        result = runner.invoke(app, [str(_clean_csv(tmp_path))], color=True)
+        assert result.exit_code == EXIT_OK
+        assert "\x1b[" not in result.output
+
+    def test_output_file_is_plain_under_auto(self, tmp_path: Path) -> None:
+        """A saved report is a durable artifact; escape codes in it are noise."""
+        dest = tmp_path / "report.txt"
+        result = runner.invoke(app, [str(_clean_csv(tmp_path)), "-o", str(dest)])
+        assert result.exit_code == EXIT_OK
+        assert "\x1b[" not in dest.read_text(encoding="utf-8")
+
+    def test_output_file_honours_color_always(self, tmp_path: Path) -> None:
+        """An explicit `always` is the user saying what they want, file included."""
+        dest = tmp_path / "report.txt"
+        result = runner.invoke(
+            app, [str(_clean_csv(tmp_path)), "-o", str(dest), "--color", "always"]
+        )
+        assert result.exit_code == EXIT_OK
+        assert "\x1b[" in dest.read_text(encoding="utf-8")
+
+    def test_json_is_never_colourised(self, tmp_path: Path) -> None:
+        """JSON is a machine contract; escape codes would break parsing."""
+        result = runner.invoke(
+            app, [str(_clean_csv(tmp_path)), "-f", "json", "--color", "always"], color=True
+        )
+        assert result.exit_code == EXIT_OK
+        assert "\x1b[" not in result.output
+        json.loads(result.output)
+
+    def test_no_color_env_suppresses_auto(self, tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        """https://no-color.org — respected for `auto`, overridden by `always`."""
+        monkeypatch.setenv("NO_COLOR", "1")
+        monkeypatch.setattr("sys.stdout.isatty", lambda: True, raising=False)
+        result = runner.invoke(app, [str(_clean_csv(tmp_path))], color=True)
+        assert "\x1b[" not in result.output

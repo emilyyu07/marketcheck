@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -20,6 +22,8 @@ from marketcheck.reporting.text_report import render_text
 # Exit codes. Validation failure and tool failure are deliberately distinct so a
 # CI pipeline can tell "the data is bad" from "the tool could not run". 2 is used
 # for tool errors because Typer/Click already exits 2 on usage errors.
+_COLOR_CHOICES = ("auto", "always", "never")
+
 EXIT_OK = 0
 EXIT_VALIDATION_FAILED = 1
 EXIT_TOOL_ERROR = 2
@@ -42,8 +46,23 @@ def validate(
     output: Annotated[
         Optional[Path], typer.Option("--output", "-o", help="Write report to file.")
     ] = None,
+    color: Annotated[
+        str,
+        typer.Option("--color", help="Colourise output: auto, always, or never."),
+    ] = "auto",
 ) -> None:
     """Validate an OHLCV data file and produce a quality report."""
+    # Reject an unknown --color value rather than falling back to a default. A
+    # silently ignored flag would leave the user believing they had configured
+    # something they had not -- the same reasoning as rejecting unknown config keys.
+    if color not in _COLOR_CHOICES:
+        typer.echo(
+            f"Error: invalid --color value: {color!r} "
+            f"(choose from {', '.join(_COLOR_CHOICES)})",
+            err=True,
+        )
+        raise typer.Exit(code=EXIT_TOOL_ERROR)
+
     # Resolve the file
     if not file.exists():
         typer.echo(f"Error: file not found: {file}", err=True)
@@ -95,18 +114,34 @@ def validate(
     # Aggregate
     summary = aggregate(results, dataset)
 
-    # Render report
+    # Decide whether to colourise.
+    #
+    # `auto` colours only an interactive stdout: a report written to a file or
+    # piped into another tool is a durable artifact, and escape codes in it are
+    # noise. `always` is an explicit override that also applies to `--output`,
+    # because a user who asks for colour in a file has said what they want.
+    # NO_COLOR (https://no-color.org) suppresses `auto` but not `always`.
+    if color == "never":
+        use_color = False
+    elif color == "always":
+        use_color = True
+    else:
+        use_color = output is None and sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+    # Render report. JSON is a machine contract and is never colourised.
     if format == "json":
         report = render_json(summary)
     else:
-        report = render_text(summary)
+        report = render_text(summary, color=use_color)
 
     # Output
     if output:
         output.write_text(report, encoding="utf-8")
         typer.echo(f"Report written to {output}")
     else:
-        typer.echo(report)
+        # `color=True` stops Click stripping the codes when stdout is not a TTY,
+        # which is what makes `--color always` meaningful in a pipe.
+        typer.echo(report, color=use_color or None)
 
     # Signal the outcome through the exit code so the tool is usable in CI.
     # A WARN is not a failure by default -- warnings cover findings a human must
